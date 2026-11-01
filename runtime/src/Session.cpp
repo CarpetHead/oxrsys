@@ -800,6 +800,7 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
 
     frameSource.alphaBlend = oxrsys::runtime::IsAlphaFrameForStreaming(
         frameEndInfo->environmentBlendMode, sourceAlphaProjectionLayer);
+    frameSource.environmentAlphaBlend = environmentAlphaBlend;
 
     if (!environmentAlphaBlend && sourceAlphaProjectionLayer)
     {

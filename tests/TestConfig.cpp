@@ -262,14 +262,18 @@ client_sharpening = 0.8suffix
     CHECK(values.clientSharpening == 0.25f);
 }
 
-TEST_CASE("Config parser accepts the Quest 3 native render preset", "[config]")
+TEST_CASE("Config parser accepts the Quest 3 native render preset and low-latency switch", "[config]")
 {
     std::istringstream input(R"TOML(
 [streaming]
 render_device = "quest3_native"
+encoder_low_latency = false
 )TOML");
 
-    CHECK(ParseConfigToml(input).renderDevice == "quest3_native");
+    const ConfigValues values = ParseConfigToml(input);
+    CHECK(values.renderDevice == "quest3_native");
+    CHECK_FALSE(values.encoderLowLatency);
+    CHECK(ConfigValues{}.encoderLowLatency);
 }
 
 TEST_CASE("Config parser accepts the medium_plus foveated encoding preset", "[config]")

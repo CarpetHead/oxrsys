@@ -1105,8 +1105,12 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
             forceSoftware ? @NO : @YES,
         (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:
             hardwareInProcess ? @YES : @NO,
-        (NSString*)kVTVideoEncoderSpecification_EnableLowLatencyRateControl: @YES,
     }];
+    const bool requestLowLatency = initialConfig.encoderLowLatency;
+    if (requestLowLatency)
+    {
+        encoderSpec[(NSString*)kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = @YES;
+    }
 
     VTCompressionSessionRef compressionSession = nullptr;
     OSStatus status = VTCompressionSessionCreate(
@@ -1120,8 +1124,9 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         CompressionOutputCallback,
         nullptr,
         &compressionSession);
-    const bool lowLatencyRateControl = status == noErr;
-    if (!lowLatencyRateControl)
+    const bool lowLatencyRateControl = status == noErr && requestLowLatency;
+    lowLatencyRateControl_ = lowLatencyRateControl;
+    if (status != noErr && requestLowLatency)
     {
         spdlog::info("VideoEncoder: {} low-latency rate control unavailable ({}); using the standard rate control",
                      VideoCodecName(codec_), status);

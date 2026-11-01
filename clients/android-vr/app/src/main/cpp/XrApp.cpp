@@ -272,17 +272,19 @@ void main() {
         }
     }
     float alpha = 1.0;
-    if (uPassthroughAlphaEnabled != 0 && uPackedAlphaEnabled != 0) {
+    bool packedAlpha = uPassthroughAlphaEnabled != 0 && uPackedAlphaEnabled != 0;
+    if (packedAlpha) {
         alpha = reconstructedPackedAlpha(corrected, decodedColor);
-        // Premultiplied colour never exceeds alpha, which recovers detail finer than the alpha grid.
-        vec3 linearColor = srgbToLinear(decodedColor);
-        alpha = max(alpha, max(max(linearColor.r, linearColor.g), linearColor.b));
     } else if (uPassthroughAlphaEnabled != 0) {
         float maxChannel = max(max(color.r, color.g), color.b);
         alpha = smoothstep(0.02, 0.10, maxChannel);
     }
     // The swapchain is GL_SRGB8_ALPHA8, so GLES encodes on write; the decoded video is already sRGB-encoded.
-    color = mix(color / 12.92, pow((color + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), color));
+    color = srgbToLinear(color);
+    if (packedAlpha) {
+        // Premultiplied colour never exceeds alpha, which recovers detail finer than the alpha grid.
+        alpha = max(alpha, max(max(color.r, color.g), color.b));
+    }
     fragColor = vec4(color, alpha);
 }
 )";
@@ -292,6 +294,16 @@ namespace oxr
 
 namespace
 {
+
+uint32_t DecoderMaxHeight(uint32_t encodedHeight)
+{
+    return encodedHeight + protocol::PackedAlphaRows(encodedHeight);
+}
+
+bool IsPackedAlphaFrame(uint32_t contentHeight, uint32_t encodedHeight)
+{
+    return contentHeight != encodedHeight && contentHeight == DecoderMaxHeight(encodedHeight);
+}
 
 constexpr float kPreferredDisplayRefreshRateHz =
     static_cast<float>(OXRSYS_PREFERRED_DISPLAY_REFRESH_RATE_HZ);
@@ -2737,6 +2749,7 @@ void XrApp::ConfigureServerConnection(const protocol::ServerAnnounce& server,
     uint32_t decoderHeight = server.encodedHeight > 0 ? server.encodedHeight : server.renderHeight;
     decodedTexelWidth_ = 1.0f / static_cast<float>(std::max(decoderWidth, 1u));
     decodedTexelHeight_ = 1.0f / static_cast<float>(std::max(decoderHeight, 1u));
+    videoEncodedHeight_ = decoderHeight;
     if (serverFoveatedEncodingEnabled_)
     {
         foveationEyeWidthRatio_ = FoveationActiveRatio(
@@ -3188,7 +3201,7 @@ void XrApp::StreamConfigWorkerMain()
             std::lock_guard<std::mutex> decoderLock(videoDecoderMutex_);
             decoderKept = videoDecoder_ && videoDecoder_->IsInitialized() &&
                 update.encodedWidth <= videoDecoder_->GetMaxWidth() &&
-                update.encodedHeight <= videoDecoder_->GetMaxHeight();
+                DecoderMaxHeight(update.encodedHeight) <= videoDecoder_->GetMaxHeight();
             if (decoderKept)
             {
                 accepted = true;
@@ -3198,7 +3211,7 @@ void XrApp::StreamConfigWorkerMain()
                 const protocol::VideoCodec codec = activeVideoCodec_.load();
                 videoDecoder_->Shutdown();
                 accepted = videoDecoder_->Initialize(update.encodedWidth, update.encodedHeight, update.encodedWidth,
-                                                     update.encodedHeight, codec);
+                                                     DecoderMaxHeight(update.encodedHeight), codec);
             }
             if (accepted)
             {
@@ -3305,10 +3318,17 @@ void XrApp::ApplyCompletedStreamConfigUpdate()
          decoderKept ? 1 : 0);
 }
 
+bool XrApp::FrameMatchesStreamConfig(const protocol::StreamConfigUpdate& update) const
+{
+    return videoContentWidth_ == update.encodedWidth &&
+        (videoContentHeight_ == update.encodedHeight || IsPackedAlphaFrame(videoContentHeight_, update.encodedHeight));
+}
+
 void XrApp::ApplyStreamConfigParameters(const protocol::StreamConfigUpdate& update)
 {
     videoWidth_ = update.renderWidth;
     videoHeight_ = update.renderHeight;
+    videoEncodedHeight_ = update.encodedHeight;
     decodedTexelWidth_ = 1.0f / static_cast<float>(std::max(update.encodedWidth, 1u));
     decodedTexelHeight_ = 1.0f / static_cast<float>(std::max(update.encodedHeight, 1u));
     serverFoveatedEncodingEnabled_ =
@@ -3699,7 +3719,8 @@ void XrApp::OnNalUnitReceived(const uint8_t* data, size_t size,
                  static_cast<uint32_t>(videoDecoder_->GetCodec()),
                  static_cast<uint32_t>(videoCodec));
         }
-        if (!videoDecoder_->Initialize(decoderWidth, decoderHeight, decoderWidth, decoderHeight, videoCodec))
+        if (!videoDecoder_->Initialize(decoderWidth, decoderHeight, decoderWidth,
+                                       DecoderMaxHeight(decoderHeight), videoCodec))
         {
             LOGE("Failed to initialize decoder for codec=%u (%s)",
                  codec, VideoCodecName(videoCodec));
@@ -3711,7 +3732,6 @@ void XrApp::OnNalUnitReceived(const uint8_t* data, size_t size,
     if (videoDecoder_ && videoDecoder_->IsInitialized())
     {
         const bool alphaBlend = (flags & protocol::VIDEO_FLAG_ALPHA_BLEND) != 0;
-        streamHasPackedAlpha_.store((flags & protocol::VIDEO_FLAG_PACKED_ALPHA) != 0);
         bool submitted = videoDecoder_->SubmitNalUnit(
             data, size, timestampNs / 1000, receiveTimeNs, alphaBlend);
         if (!submitted)
@@ -3978,7 +3998,7 @@ void XrApp::RunFrame()
         {
             projectionLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
             // Packed-alpha video is premultiplied; the shell and black-key paths keep the unpremultiplied blend.
-            if (!renderedVideo || !streamHasPackedAlpha_.load())
+            if (!renderedVideo || !IsPackedAlphaFrame(videoContentHeight_, videoEncodedHeight_))
             {
                 projectionLayer.layerFlags |= XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
             }
@@ -4188,24 +4208,16 @@ bool XrApp::RenderFrame(XrTime predictedDisplayTime)
                             static_cast<float>(cropBottom) / static_cast<float>(sampleHeight));
                         videoContentWidth_ = static_cast<uint32_t>(cropRight - cropLeft);
                         videoContentHeight_ = static_cast<uint32_t>(cropBottom - cropTop);
-
-                        hasVideo = true;
-                        // The update's encodedHeight is the eyes only; packed alpha rows sit below them.
-                        const uint32_t deferredFrameHeight = streamHasPackedAlpha_.load()
-                            ? frameDeferredStreamConfig_.encodedHeight +
-                                  protocol::PackedAlphaRows(frameDeferredStreamConfig_.encodedHeight)
-                            : frameDeferredStreamConfig_.encodedHeight;
-                        const bool frameHasDeferredSize = hasFrameDeferredStreamConfig_ &&
-                            static_cast<uint32_t>(cropRight - cropLeft) == frameDeferredStreamConfig_.encodedWidth &&
-                            static_cast<uint32_t>(cropBottom - cropTop) == deferredFrameHeight;
-                        if (frameHasDeferredSize ||
-                            (hasFrameDeferredStreamConfig_ &&
+                        if (hasFrameDeferredStreamConfig_ &&
+                            (FrameMatchesStreamConfig(frameDeferredStreamConfig_) ||
                              std::chrono::steady_clock::now() - frameDeferredStreamConfigSince_ >
                                  std::chrono::milliseconds(500)))
                         {
                             hasFrameDeferredStreamConfig_ = false;
                             ApplyStreamConfigParameters(frameDeferredStreamConfig_);
                         }
+
+                        hasVideo = true;
                         hasVideoTexture_ = true;
                         lastVideoFrameTime_ = std::chrono::steady_clock::now();
                         presentedVideoFrame_.valid = true;
@@ -4398,7 +4410,7 @@ void XrApp::BlitVideoToSwapchain(int eye)
     float uMin = (eye == 0) ? contentUMin : contentMidU;
     float uMax = (eye == 0) ? contentMidU : contentUMax;
 
-    const bool packedAlpha = streamHasPackedAlpha_.load() && videoContentWidth_ > 0 && videoContentHeight_ > 0;
+    const bool packedAlpha = videoContentWidth_ > 0 && IsPackedAlphaFrame(videoContentHeight_, videoEncodedHeight_);
     const uint32_t eyeHeight = packedAlpha ? protocol::PackedAlphaEyeHeight(videoContentHeight_) : videoContentHeight_;
     const float contentTexelU = videoContentWidth_ > 0
         ? (contentUMax - contentUMin) / static_cast<float>(videoContentWidth_) : decodedTexelWidth_;

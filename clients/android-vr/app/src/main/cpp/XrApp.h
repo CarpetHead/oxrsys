@@ -119,6 +119,7 @@ private:
     void StreamConfigWorkerMain();
     void ApplyCompletedStreamConfigUpdate();
     void ApplyStreamConfigParameters(const protocol::StreamConfigUpdate& update);
+    bool FrameMatchesStreamConfig(const protocol::StreamConfigUpdate& update) const;
     void SendStreamConfigAck(const protocol::StreamConfigUpdate& update, uint8_t status);
     void SendLatencyReport();
     void RequestKeyframe(uint32_t reasonFlags, uint32_t detail);
@@ -305,8 +306,8 @@ private:
     float videoContentVMin_ = 0.0f;
     float videoContentVMax_ = 1.0f;
     uint32_t videoContentWidth_ = 0;
+    uint32_t videoEncodedHeight_ = 0;
     uint32_t videoContentHeight_ = 0;
-    std::atomic<bool> streamHasPackedAlpha_{false};
     uint32_t clientRefreshRateHz_ = 90;
     protocol::ClientFoveationPreset clientFoveationPreset_ =
         protocol::ClientFoveationPreset::Off;

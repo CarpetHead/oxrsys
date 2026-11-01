@@ -159,6 +159,8 @@ struct FrameSource
     FrameImageSource left = {};
     FrameImageSource right = {};
     bool alphaBlend = false;
+    // The app asked for XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND, not only source-alpha layer flags.
+    bool environmentAlphaBlend = false;
     std::vector<FrameOverlayLayer> overlays = {}; // back to front, all after the projection layer
 
     bool IsStereoValid() const
@@ -171,6 +173,7 @@ struct FrameSource
         left.Reset();
         right.Reset();
         alphaBlend = false;
+        environmentAlphaBlend = false;
         overlays.clear();
     }
 };

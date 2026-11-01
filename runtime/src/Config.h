@@ -24,6 +24,7 @@ struct ConfigValues
     std::string videoCodec = "h265"; // "h265", "h264", "auto"
     std::string encoderPreset = "balanced"; // "quality", "balanced", "speed"
     bool encoder10Bit = false;      // Encode HEVC Main10 for capable H.265 clients
+    bool encoderLowLatency = true;  // Request VideoToolbox low-latency rate control
     // send_pacing_ms: spread each encoded frame's UDP packets evenly over this many ms instead
     // of handing them to the socket as one burst (an AP queue under contention drops a burst's
     // tail, and the XOR FEC cannot repair consecutive losses). Capped at 0.8 of the frame period;

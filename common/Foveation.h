@@ -61,6 +61,20 @@ inline FoveationPresetParameters MediumPlusParameters()
     return {0.50f, 0.45f, 0.0f, 0.0f, 4.0f, 5.0f};
 }
 
+// Each level shrinks the full-resolution centre by 12% and compresses the edges one step further,
+// about 20% fewer encoded pixels per level for the medium presets.
+inline FoveationPresetParameters StrongerFoveationParameters(FoveationPresetParameters params, uint32_t level)
+{
+    for (uint32_t i = 0; i < level; ++i)
+    {
+        params.centerSizeX *= 0.88f;
+        params.centerSizeY *= 0.88f;
+        params.edgeRatioX += 1.0f;
+        params.edgeRatioY += 1.0f;
+    }
+    return params;
+}
+
 // The centre shift that puts an eye's full-resolution region on its forward direction. An asymmetric
 // eye frustum (each Quest eye sees further outwards than inwards) has its forward direction off the image
 // centre. tanNear and tanFar are the tangents of the half-angles towards the axis start (left or up) and
