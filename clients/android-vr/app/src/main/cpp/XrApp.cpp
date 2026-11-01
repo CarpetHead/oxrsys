@@ -121,6 +121,9 @@ uniform vec2 uFoveationEyeSizeRatio;
 uniform int uReprojectionWarpEnabled;
 uniform vec2 uReprojectionWarpOffset;
 uniform int uPassthroughAlphaEnabled;
+uniform int uPackedAlphaEnabled;
+uniform vec2 uAlphaSourceMin;
+uniform vec2 uAlphaSourceMax;
 
 float compressAxis(float eyeUv, float centerSize, float centerShift, float edgeRatio) {
     float c0 = (1.0 - centerSize) * 0.5;
@@ -234,7 +237,9 @@ void main() {
         }
     }
     float alpha = 1.0;
-    if (uPassthroughAlphaEnabled != 0) {
+    if (uPassthroughAlphaEnabled != 0 && uPackedAlphaEnabled != 0) {
+        alpha = texture(uTexture, mix(uAlphaSourceMin, uAlphaSourceMax, eyeUv)).r;
+    } else if (uPassthroughAlphaEnabled != 0) {
         float maxChannel = max(max(color.r, color.g), color.b);
         alpha = smoothstep(0.02, 0.10, maxChannel);
     }
@@ -1952,6 +1957,9 @@ bool XrApp::CreateSwapchains()
         glGetUniformLocation(blitProgram_, "uReprojectionWarpOffset");
     blitPassthroughAlphaEnabledUniform_ =
         glGetUniformLocation(blitProgram_, "uPassthroughAlphaEnabled");
+    blitPackedAlphaEnabledUniform_ = glGetUniformLocation(blitProgram_, "uPackedAlphaEnabled");
+    blitAlphaSourceMinUniform_ = glGetUniformLocation(blitProgram_, "uAlphaSourceMin");
+    blitAlphaSourceMaxUniform_ = glGetUniformLocation(blitProgram_, "uAlphaSourceMax");
 
     glUseProgram(blitProgram_);
     glUniform1i(blitTextureUniform_, 0);
@@ -2805,7 +2813,8 @@ void XrApp::SendClientConnect(const char* serverIp)
     }
     if (CanUseShellPassthrough())
     {
-        connect.clientCapabilities |= protocol::CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH;
+        connect.clientCapabilities |= protocol::CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH |
+            protocol::CLIENT_CAPABILITY_MIXED_REALITY_ALPHA;
     }
     connect.audioSampleRateHz = 48000;
     strncpy(connect.deviceName, headsetSystemName_, sizeof(connect.deviceName) - 1);
@@ -3537,6 +3546,7 @@ void XrApp::OnNalUnitReceived(const uint8_t* data, size_t size,
     if (videoDecoder_ && videoDecoder_->IsInitialized())
     {
         const bool alphaBlend = (flags & protocol::VIDEO_FLAG_ALPHA_BLEND) != 0;
+        streamHasPackedAlpha_.store((flags & protocol::VIDEO_FLAG_PACKED_ALPHA) != 0);
         bool submitted = videoDecoder_->SubmitNalUnit(
             data, size, timestampNs / 1000, receiveTimeNs, alphaBlend);
         if (!submitted)
@@ -4000,6 +4010,7 @@ bool XrApp::RenderFrame(XrTime predictedDisplayTime)
                             static_cast<float>(cropTop) / static_cast<float>(sampleHeight));
                         videoContentVMax_ = ClampNormalized(
                             static_cast<float>(cropBottom) / static_cast<float>(sampleHeight));
+                        videoContentHeight_ = static_cast<uint32_t>(cropBottom - cropTop);
 
                         hasVideo = true;
                         hasVideoTexture_ = true;
@@ -4194,12 +4205,26 @@ void XrApp::BlitVideoToSwapchain(int eye)
     float uMin = (eye == 0) ? contentUMin : contentMidU;
     float uMax = (eye == 0) ? contentMidU : contentUMax;
 
+    const bool packedAlpha = streamHasPackedAlpha_.load() && videoContentHeight_ > 0;
+    float eyeHeightFraction = 1.0f;
+    if (packedAlpha)
+    {
+        eyeHeightFraction = static_cast<float>(protocol::PackedAlphaEyeHeight(videoContentHeight_)) /
+            static_cast<float>(videoContentHeight_);
+    }
+    const float eyeVMax = contentVMin + (contentVMax - contentVMin) * eyeHeightFraction;
+    const float halfTexelU = decodedTexelWidth_ * 0.5f;
+    const float halfTexelV = decodedTexelHeight_ * 0.5f * eyeHeightFraction;
+
     glUseProgram(blitProgram_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
     glUniform2f(blitEyeSourceMinUniform_, uMin, contentVMin);
-    glUniform2f(blitEyeSourceMaxUniform_, uMax, contentVMax);
+    glUniform2f(blitEyeSourceMaxUniform_, uMax, eyeVMax);
     glUniform2f(blitLogicalTexelSizeUniform_, decodedTexelWidth_ * 2.0f, decodedTexelHeight_);
+    glUniform1i(blitPackedAlphaEnabledUniform_, packedAlpha ? 1 : 0);
+    glUniform2f(blitAlphaSourceMinUniform_, uMin + halfTexelU, eyeVMax + halfTexelV);
+    glUniform2f(blitAlphaSourceMaxUniform_, uMax - halfTexelU, contentVMax - halfTexelV);
     glUniform1i(blitFoveatedEncodingEnabledUniform_, serverFoveatedEncodingEnabled_ ? 1 : 0);
     glUniform1i(blitClientUpscalingEnabledUniform_, clientUpscalingEnabled_ ? 1 : 0);
     glUniform2f(blitFoveationCenterSizeUniform_,

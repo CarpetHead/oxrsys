@@ -82,6 +82,16 @@ struct MetalFoveationUniforms
     vector_uint2 sourceSrgb;
 };
 
+struct MetalAlphaPackUniforms
+{
+    uint32_t outputWidth;
+    uint32_t eyeWidth;
+    uint32_t eyeHeight;
+    uint32_t alphaRows;
+    uint32_t stereo;
+    uint32_t padding[3];
+};
+
 struct MetalVideoCopyUniforms
 {
     vector_uint2 destinationOrigin;
@@ -133,6 +143,37 @@ kernel void video_copy_kernel(texture2d<float, access::sample> sourceTexture [[t
         color.rgb = linear_to_srgb(color.rgb);
     }
     outputTexture.write(color, params.destinationOrigin + gid);
+}
+
+struct AlphaPackUniforms
+{
+    uint outputWidth;
+    uint eyeWidth;
+    uint eyeHeight;
+    uint alphaRows;
+    uint stereo;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+};
+
+kernel void alpha_pack_kernel(texture2d<float, access::sample> leftTexture [[texture(0)]],
+                              texture2d<float, access::sample> rightTexture [[texture(1)]],
+                              texture2d<float, access::write> outputTexture [[texture(2)]],
+                              sampler linearSampler [[sampler(0)]],
+                              constant AlphaPackUniforms& params [[buffer(0)]],
+                              uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= params.outputWidth || gid.y >= params.alphaRows)
+    {
+        return;
+    }
+
+    bool rightEye = params.stereo != 0 && gid.x >= params.eyeWidth;
+    uint localX = rightEye ? gid.x - params.eyeWidth : gid.x;
+    float2 uv = (float2(localX, gid.y) + float2(0.5)) / float2(params.eyeWidth, params.alphaRows);
+    float alpha = rightEye ? rightTexture.sample(linearSampler, uv).a : leftTexture.sample(linearSampler, uv).a;
+    outputTexture.write(float4(alpha, alpha, alpha, 1.0), uint2(gid.x, params.eyeHeight + gid.y));
 }
 )METAL";
 
@@ -569,7 +610,7 @@ bool TextureAllowsUsage(id<MTLTexture> texture, MTLTextureUsage requiredUsage)
            (declaredUsage & requiredUsage) == requiredUsage;
 }
 
-id<MTLComputePipelineState> CreateVideoCopyPipeline(id<MTLDevice> device)
+id<MTLComputePipelineState> CreateVideoComputePipeline(id<MTLDevice> device, NSString* functionName)
 {
     NSError* error = nil;
     NSString* source = [NSString stringWithUTF8String:kVideoCopyMetalSource];
@@ -581,7 +622,7 @@ id<MTLComputePipelineState> CreateVideoCopyPipeline(id<MTLDevice> device)
         return nil;
     }
 
-    id<MTLFunction> kernelFunction = [library newFunctionWithName:@"video_copy_kernel"];
+    id<MTLFunction> kernelFunction = [library newFunctionWithName:functionName];
     if (kernelFunction == nil)
     {
         spdlog::error("VideoEncoder: Failed to load texture conversion entry point");
@@ -821,6 +862,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
 
     width_ = width;
     height_ = height;
+    frameHeight_ = packedAlpha_ ? height + oxr::protocol::PackedAlphaRows(height) : height;
     eyeWidth_ = width / 2;
     fps_ = fps;
     bitrateMbps_ = bitrateMbps;
@@ -843,7 +885,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
 
     videoToolbox_.commandQueue = (void*)[device newCommandQueue];
     videoToolbox_.scaler = (void*)[[MPSImageBilinearScale alloc] initWithDevice:device];
-    videoToolbox_.copyPipeline = (void*)CreateVideoCopyPipeline(device);
+    videoToolbox_.copyPipeline = (void*)CreateVideoComputePipeline(device, @"video_copy_kernel");
     videoToolbox_.copySampler = (void*)CreateLinearClampSampler(device);
     if (videoToolbox_.commandQueue == nullptr || videoToolbox_.scaler == nullptr ||
         videoToolbox_.copyPipeline == nullptr || videoToolbox_.copySampler == nullptr)
@@ -863,6 +905,17 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
             return false;
         }
     }
+    if (packedAlpha_)
+    {
+        videoToolbox_.alphaPackPipeline = (void*)CreateVideoComputePipeline(device, @"alpha_pack_kernel");
+        if (videoToolbox_.alphaPackPipeline == nullptr)
+        {
+            spdlog::error("VideoEncoder: Packed alpha was negotiated but the shader is unavailable");
+            Shutdown();
+            return false;
+        }
+        spdlog::info("VideoEncoder: packing eye alpha into {} rows below the {}x{} eyes", frameHeight_ - height_, width_, height_);
+    }
 
     CVMetalTextureCacheRef cache = nullptr;
     CVReturn cvResult = CVMetalTextureCacheCreate(
@@ -879,7 +932,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     };
     NSDictionary* poolAttrs = @{
         (NSString*)kCVPixelBufferWidthKey: @(width),
-        (NSString*)kCVPixelBufferHeightKey: @(height),
+        (NSString*)kCVPixelBufferHeightKey: @(frameHeight_),
         (NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
         (NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{},
         (NSString*)kCVPixelBufferMetalCompatibilityKey: @YES,
@@ -939,7 +992,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
             nullptr,
             MTLPixelFormatBGRA8Unorm,
             width_,
-            height_,
+            frameHeight_,
             0,
             &cvMetalTexture);
         if (cvResult != kCVReturnSuccess || cvMetalTexture == nullptr)
@@ -978,7 +1031,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     const bool forceSoftware = forceSoftwareForTesting_;
     const bool hardwareInProcess =
         !forceSoftware &&
-        HardwareEncoderAvailableInProcess(VideoToolboxCodecType(codec_), width, height);
+        HardwareEncoderAvailableInProcess(VideoToolboxCodecType(codec_), width, frameHeight_);
     {
         oxrsys::encoder::EncodePathInputs pathInputs;
         pathInputs.codec = codec_;
@@ -1011,7 +1064,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     OSStatus status = VTCompressionSessionCreate(
         kCFAllocatorDefault,
         width,
-        height,
+        frameHeight_,
         VideoToolboxCodecType(codec_),
         (__bridge CFDictionaryRef)encoderSpec,
         nullptr,
@@ -1032,7 +1085,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
             (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @NO,
         };
         status = VTCompressionSessionCreate(
-            kCFAllocatorDefault, width, height, VideoToolboxCodecType(codec_),
+            kCFAllocatorDefault, width, frameHeight_, VideoToolboxCodecType(codec_),
             (__bridge CFDictionaryRef)relaxedSpec, nullptr, kCFAllocatorDefault,
             CompressionOutputCallback, nullptr, &compressionSession);
     }
@@ -1176,7 +1229,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     // and this session takes over mid-stream. Hand it an explicitly video-range
     // 4:2:0 conversion of each frame instead; see EncoderSessionColor.h. Set up
     // now, not on helper death, so the fallback never allocates on the frame path.
-    if (!inProcessSessionHardware_ && !CreateVideoRangeConversion(width, height))
+    if (!inProcessSessionHardware_ && !CreateVideoRangeConversion(width, frameHeight_))
     {
         spdlog::warn("VideoEncoder: could not set up the video-range conversion for the software "
                      "{} session - its stream may signal full range",
@@ -1304,7 +1357,7 @@ bool VideoEncoder::TryStartHelper()
 
     EncoderHelperClient::Config helperConfig;
     helperConfig.width = width_;
-    helperConfig.height = height_;
+    helperConfig.height = frameHeight_;
     helperConfig.fps = fps_;
     helperConfig.bitrateMbps = bitrateMbps_;
     helperConfig.keyframeIntervalSec = config.keyframeIntervalSec;
@@ -1469,6 +1522,53 @@ void VideoEncoder::OnHelperDied()
     ReclaimHelperFrames("encoder helper died");
 }
 
+bool VideoEncoder::EncodeAlphaPack(void* commandBuffer, void* leftTexture, void* rightTexture, void* outputTexture, bool stereo)
+{
+    id<MTLCommandBuffer> cmdBuf = (id<MTLCommandBuffer>)commandBuffer;
+    id<MTLTexture> leftTex = (id<MTLTexture>)leftTexture;
+    id<MTLTexture> rightTex = (id<MTLTexture>)rightTexture;
+    id<MTLTexture> dstTexture = (id<MTLTexture>)outputTexture;
+    id<MTLComputePipelineState> pipeline = (id<MTLComputePipelineState>)videoToolbox_.alphaPackPipeline;
+    if (pipeline == nil || dstTexture.height < (NSUInteger)frameHeight_ ||
+        !TextureAllowsUsage(leftTex, MTLTextureUsageShaderRead) ||
+        !TextureAllowsUsage(rightTex, MTLTextureUsageShaderRead) ||
+        !TextureAllowsUsage(dstTexture, MTLTextureUsageShaderWrite))
+    {
+        return false;
+    }
+
+    MetalAlphaPackUniforms uniforms = {};
+    uniforms.outputWidth = width_;
+    uniforms.eyeWidth = stereo ? eyeWidth_ : width_;
+    uniforms.eyeHeight = height_;
+    uniforms.alphaRows = frameHeight_ - height_;
+    uniforms.stereo = stereo ? 1u : 0u;
+
+    id<MTLComputeCommandEncoder> computeEncoder = [cmdBuf computeCommandEncoder];
+    if (computeEncoder == nil)
+    {
+        return false;
+    }
+    [computeEncoder setComputePipelineState:pipeline];
+    [computeEncoder setTexture:leftTex atIndex:0];
+    [computeEncoder setTexture:rightTex atIndex:1];
+    [computeEncoder setTexture:dstTexture atIndex:2];
+    [computeEncoder setSamplerState:(id<MTLSamplerState>)videoToolbox_.copySampler atIndex:0];
+    [computeEncoder setBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+
+    const NSUInteger threadsX = std::max<NSUInteger>(1, std::min<NSUInteger>(pipeline.threadExecutionWidth, 16));
+    const NSUInteger threadsY = std::max<NSUInteger>(
+        1,
+        std::min<NSUInteger>(pipeline.maxTotalThreadsPerThreadgroup / threadsX, 16));
+    const MTLSize threadgroups = MTLSizeMake(
+        ((NSUInteger)uniforms.outputWidth + threadsX - 1) / threadsX,
+        ((NSUInteger)uniforms.alphaRows + threadsY - 1) / threadsY,
+        1);
+    [computeEncoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:MTLSizeMake(threadsX, threadsY, 1)];
+    [computeEncoder endEncoding];
+    return true;
+}
+
 bool VideoEncoder::Shutdown(std::chrono::nanoseconds timeout)
 {
     const auto deadline = Clock::now() + timeout;
@@ -1577,6 +1677,11 @@ bool VideoEncoder::Shutdown(std::chrono::nanoseconds timeout)
     {
         [(id<MTLSamplerState>)videoToolbox_.foveationSampler release];
         videoToolbox_.foveationSampler = nullptr;
+    }
+    if (videoToolbox_.alphaPackPipeline != nullptr)
+    {
+        [(id<MTLComputePipelineState>)videoToolbox_.alphaPackPipeline release];
+        videoToolbox_.alphaPackPipeline = nullptr;
     }
     if (videoToolbox_.commandQueue != nullptr)
     {
@@ -2124,6 +2229,11 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
              destinationLevel:0
             destinationOrigin:MTLOriginMake(0, 0, 0)];
         [blit endEncoding];
+    }
+
+    if (packedAlpha_ && !EncodeAlphaPack((void*)cmdBuf, (void*)leftTex, (void*)(stereo ? rightTex : leftTex), (void*)dstTexture, stereo))
+    {
+        return dropAcquiredSlot("failed to pack eye alpha");
     }
 
     auto* context = new EncodeFrameContext();

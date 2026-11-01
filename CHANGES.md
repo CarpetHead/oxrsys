@@ -6,6 +6,11 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Added
 
+- Added packed passthrough alpha. When passthrough and `app_alpha_blend_passthrough` are enabled and the
+  Quest/Pico client advertises `CLIENT_CAPABILITY_MIXED_REALITY_ALPHA`, the runtime appends each eye's alpha
+  below the eyes at half the eye height and marks the frames `VIDEO_FLAG_PACKED_ALPHA`. The client reads that
+  alpha instead of keying out near-black pixels, so black content stays opaque and semi-transparent content
+  blends with the passthrough cameras.
 - Added `pacing_thread = "realtime"` (`[streaming]`, default `"default"`): the thread that waits in
   `xrWaitFrame` gets a Mach time-constraint policy, so its sleep to each frame deadline wakes on time.
   At default priority that wake lands about 2.7 ms late on average and up to 6 ms (M5, 72 Hz), which

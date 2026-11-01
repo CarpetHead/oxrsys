@@ -249,6 +249,9 @@ private:
     GLint blitReprojectionWarpEnabledUniform_ = -1;
     GLint blitReprojectionWarpOffsetUniform_ = -1;
     GLint blitPassthroughAlphaEnabledUniform_ = -1;
+    GLint blitPackedAlphaEnabledUniform_ = -1;
+    GLint blitAlphaSourceMinUniform_ = -1;
+    GLint blitAlphaSourceMaxUniform_ = -1;
     GLint shellMvpUniform_ = -1;
 
     // Networking
@@ -294,6 +297,8 @@ private:
     float videoContentUMax_ = 1.0f;
     float videoContentVMin_ = 0.0f;
     float videoContentVMax_ = 1.0f;
+    uint32_t videoContentHeight_ = 0;
+    std::atomic<bool> streamHasPackedAlpha_{false};
     uint32_t clientRefreshRateHz_ = 90;
     protocol::ClientFoveationPreset clientFoveationPreset_ =
         protocol::ClientFoveationPreset::Off;
