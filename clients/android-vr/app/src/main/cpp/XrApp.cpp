@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "XrApp.h"
+#include "UsbNetworkLink.h"
 
 #include <android/hardware_buffer.h>
 #include <android/log.h>
@@ -126,54 +127,44 @@ uniform vec2 uAlphaOrigin;
 uniform vec2 uContentTexelSize;
 uniform vec2 uAlphaTileSize;
 
-float compressAxis(float eyeUv, float centerSize, float centerShift, float edgeRatio) {
+// Closed-form inverse of the server's AADT compress_axis warp, the same solution as the visionOS
+// client's decompressAxis: linear in the center, the stable small root of a quadratic on each
+// edge. Also returns the inverse's local slope so neighbor taps a few texels away can be placed
+// linearly. CPU copy for the host tests: QuestFoveation.h; change both together.
+float decompressAxisAndSlope(float targetUv, float centerSize, float centerShift,
+                             float edgeRatio, out float invSlope) {
     float c0 = (1.0 - centerSize) * 0.5;
     float c1 = (edgeRatio - 1.0) * c0 * (centerShift + 1.0) / edgeRatio;
     float c2 = (edgeRatio - 1.0) * centerSize + 1.0;
     float loBound = c0 * (centerShift + 1.0) / c2;
     float hiBound = c0 * (centerShift - 1.0) / c2 + 1.0;
-    float center = eyeUv * c2 / edgeRatio + c1;
-    float d2 = eyeUv * c2;
-    float d3 = (eyeUv - 1.0) * c2 + 1.0;
-    float g1 = loBound > 0.0 ? eyeUv / loBound : 1.0;
-    float g2 = (1.0 - hiBound) > 0.0 ? (1.0 - eyeUv) / (1.0 - hiBound) : 1.0;
-    float leftEdge = g1 * center + (1.0 - g1) * d2;
-    float rightEdge = g2 * center + (1.0 - g2) * d3;
-    if (eyeUv < loBound) {
-        return leftEdge;
-    }
-    if (eyeUv > hiBound) {
-        return rightEdge;
-    }
-    return center;
-}
+    float tLo = loBound * c2 / edgeRatio + c1;
+    float tHi = hiBound * c2 / edgeRatio + c1;
 
-// Binary search inverse of compressAxis. Also returns the warp's local derivative
-// (via one extra cheap finite-difference eval) so callers sampling a few texels away
-// from targetUv can place those neighbor taps with a linear extrapolation instead of
-// re-running the full 10-iteration search -- the warp is smooth, so this is accurate
-// to well within a texel for the tiny offsets used by the upscale sharpen kernel.
-float decompressAxisAndSlope(float targetUv, float centerSize, float centerShift,
-                              float edgeRatio, out float invSlope) {
-    float lo = 0.0;
-    float hi = 1.0;
-    float mid = 0.5;
-    for (int i = 0; i < 10; ++i) {
-        mid = (lo + hi) * 0.5;
-        float mapped = compressAxis(mid, centerSize, centerShift, edgeRatio);
-        if (mapped < targetUv) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
+    float eyeUv;
+    float slope;
+    if (targetUv < tLo && loBound > 0.0) {
+        // Left edge: t = a*u^2 + b*u with a < 0, b > 0; small root through (0, 0).
+        float a = (c2 / loBound) * (1.0 / edgeRatio - 1.0);
+        float b = c1 / loBound + c2;
+        eyeUv = 2.0 * targetUv / (b + sqrt(max(b * b + 4.0 * a * targetUv, 0.0)));
+        slope = 2.0 * a * eyeUv + b;
+    } else if (targetUv > tHi && hiBound < 1.0) {
+        // Right edge: with v = 1-u, t-1 = a*v^2 + b*v with a > 0, b < 0; small root through
+        // (t=1, v=0).
+        float w = 1.0 - hiBound;
+        float a = (c2 / w) * (1.0 - 1.0 / edgeRatio);
+        float b = (c2 / edgeRatio + c1 - 1.0) / w - c2;
+        float d = max(b * b - 4.0 * a * (1.0 - targetUv), 0.0);
+        float v = 2.0 * (1.0 - targetUv) / (-b + sqrt(d));
+        eyeUv = 1.0 - v;
+        slope = -(2.0 * a * v + b);
+    } else {
+        eyeUv = (targetUv - c1) * edgeRatio / c2;
+        slope = c2 / edgeRatio;
     }
-    mid = (lo + hi) * 0.5;
-    const float eps = 0.001;
-    float fPlus = compressAxis(min(mid + eps, 1.0), centerSize, centerShift, edgeRatio);
-    float fMinus = compressAxis(max(mid - eps, 0.0), centerSize, centerShift, edgeRatio);
-    float slope = (fPlus - fMinus) / (2.0 * eps);
     invSlope = abs(slope) > 0.0001 ? 1.0 / slope : 1.0;
-    return mid;
+    return eyeUv;
 }
 
 float luma(vec3 color) {
@@ -243,7 +234,7 @@ void main() {
                       vec2(0.0), vec2(1.0));
     }
 
-    // Expensive iterative de-foveation warp: evaluated once, at the center sample only.
+    // De-foveation warp: evaluated once, at the center sample only.
     vec2 corrected;
     vec2 invSlope;
     if (uFoveatedEncodingEnabled != 0) {
@@ -268,7 +259,7 @@ void main() {
 
     if (uClientUpscalingEnabled != 0) {
         vec2 stepUv = max(uLogicalTexelSize, vec2(0.00001));
-        // Linearized neighbor placement -- no extra binary searches.
+        // Linearized neighbor placement from the inverse slope -- no extra inverse evaluations.
         vec2 sourceStep = stepUv * invSlope * sourceRange;
         vec3 left = sampleSource(sourceUv - vec2(sourceStep.x, 0.0));
         vec3 right = sampleSource(sourceUv + vec2(sourceStep.x, 0.0));
@@ -2406,6 +2397,12 @@ bool XrApp::OpenControlSocket(const char* serverIp)
         LOGE("Failed to create control socket");
         return false;
     }
+    if (!usb_network::BindSocketForServer(controlSocket_, serverIp))
+    {
+        close(controlSocket_);
+        controlSocket_ = -1;
+        return false;
+    }
 
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
@@ -2520,7 +2517,10 @@ void XrApp::CloseSpatialSocket()
 
 void XrApp::OnServerFound(const protocol::ServerAnnounce& server, const char* serverIp)
 {
-    ConfigureServerConnection(server, serverIp, TransportMode::WifiUdp);
+    ConfigureServerConnection(server, serverIp,
+                              usb_network::IsServerAddress(serverIp)
+                                  ? TransportMode::UsbNetworkUdp
+                                  : TransportMode::WifiUdp);
 }
 
 bool XrApp::TryStartUsbAdbTransport(bool logUnavailable)
@@ -2631,13 +2631,15 @@ void XrApp::ConfigureServerConnection(const protocol::ServerAnnounce& server,
     }
     shellStatusText_ = transportMode == TransportMode::UsbAdbTcp
         ? "Connecting USB"
+        : transportMode == TransportMode::UsbNetworkUdp
+        ? "Connecting USB network"
         : "Connecting WiFi";
 
     transportMode_ = transportMode;
     const bool usbAdb = transportMode_ == TransportMode::UsbAdbTcp;
 
     LOGI("Server discovered via %s: %s at %s (%ux%u @ %uHz, encoded %ux%u)",
-         usbAdb ? "USB ADB" : "WiFi",
+         usbAdb ? "USB ADB" : transportMode_ == TransportMode::UsbNetworkUdp ? "USB network" : "WiFi",
          server.serverName, serverIp, server.renderWidth, server.renderHeight,
          server.refreshRateHz, server.encodedWidth, server.encodedHeight);
 
@@ -2893,7 +2895,8 @@ void XrApp::SendClientConnect(const char* serverIp)
     connect.supportedCodecs =
         protocol::CLIENT_CODEC_CAPABILITY_H265 |
         protocol::CLIENT_CODEC_CAPABILITY_H264;
-    connect.maxBitrateMbps = usbAdb
+    // The WiFi cap protects shared wireless links; the USB network link is a dedicated cable.
+    connect.maxBitrateMbps = usbAdb || transportMode_ == TransportMode::UsbNetworkUdp
         ? protocol::CLIENT_MAX_BITRATE_USE_SERVER_CONFIG
         : 100;
     connect.refreshRateHz = clientRefreshRateHz_;

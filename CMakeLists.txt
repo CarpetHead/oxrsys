@@ -186,6 +186,7 @@ add_executable(oxrsys_runtime_tests
     tests/TestStreamingReconfigure.cpp
     tests/TestEncodeBudget.cpp
     tests/TestSnapshotLeasePool.cpp
+    tests/TestSnapshotWaitPolicy.cpp
     tests/TestSwapchainCreateValidation.cpp
     tests/TestVideoCodecSelection.cpp
     tests/TestVideoTextureFormat.cpp
@@ -195,6 +196,7 @@ add_executable(oxrsys_runtime_tests
     tests/TestProtocolLayout.cpp
     tests/TestQuestPassthroughAlphaPolicy.cpp
     tests/TestQuestShellInteraction.cpp
+    tests/TestQuestFoveation.cpp
     clients/android-vr/app/src/main/cpp/QuestPassthroughAlphaPolicy.cpp
     clients/android-vr/app/src/main/cpp/QuestShellInteraction.cpp
     runtime/src/InputManager.cpp
