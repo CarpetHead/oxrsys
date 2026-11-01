@@ -6,6 +6,9 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Added
 
+- Added controller haptics. `xrApplyHapticFeedback` and `xrStopHapticFeedback` now send `HapticsCommand`
+  over the control channel, USB or WiFi, and the Quest/Pico client plays it through its own haptic output
+  action. Before, both calls succeeded without anything reaching the headset.
 - Added packed passthrough alpha. When passthrough and `app_alpha_blend_passthrough` are enabled and the
   Quest/Pico client advertises `CLIENT_CAPABILITY_MIXED_REALITY_ALPHA`, the runtime appends each eye's alpha
   below the eyes at half the eye height and marks the frames `VIDEO_FLAG_PACKED_ALPHA`. The client reads that
