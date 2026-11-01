@@ -117,6 +117,8 @@ private:
     void StopStreamConfigWorker();
     void StreamConfigWorkerMain();
     void ApplyCompletedStreamConfigUpdate();
+    void ApplyStreamConfigParameters(const protocol::StreamConfigUpdate& update);
+    bool FrameMatchesStreamConfig(const protocol::StreamConfigUpdate& update) const;
     void SendStreamConfigAck(const protocol::StreamConfigUpdate& update, uint8_t status);
     void SendLatencyReport();
     void RequestKeyframe(uint32_t reasonFlags, uint32_t detail);
@@ -167,6 +169,8 @@ private:
     bool foveationConfigurationAvailable_ = false;
     bool swapchainUpdateAvailable_ = false;
     bool displayRefreshRateAvailable_ = false;
+    bool compositionLayerSettingsAvailable_ = false;
+    bool serverFoveationEyeCentered_ = false;
     PFN_xrCreateFoveationProfileFB xrCreateFoveationProfileFB_ = nullptr;
     PFN_xrDestroyFoveationProfileFB xrDestroyFoveationProfileFB_ = nullptr;
     PFN_xrUpdateSwapchainFB xrUpdateSwapchainFB_ = nullptr;
@@ -252,8 +256,9 @@ private:
     GLint blitReprojectionWarpOffsetUniform_ = -1;
     GLint blitPassthroughAlphaEnabledUniform_ = -1;
     GLint blitPackedAlphaEnabledUniform_ = -1;
-    GLint blitAlphaSourceMinUniform_ = -1;
-    GLint blitAlphaSourceMaxUniform_ = -1;
+    GLint blitAlphaOriginUniform_ = -1;
+    GLint blitContentTexelSizeUniform_ = -1;
+    GLint blitAlphaTileSizeUniform_ = -1;
     GLint shellMvpUniform_ = -1;
 
     // Networking
@@ -299,8 +304,9 @@ private:
     float videoContentUMax_ = 1.0f;
     float videoContentVMin_ = 0.0f;
     float videoContentVMax_ = 1.0f;
+    uint32_t videoContentWidth_ = 0;
+    uint32_t videoEncodedHeight_ = 0;
     uint32_t videoContentHeight_ = 0;
-    std::atomic<bool> streamHasPackedAlpha_{false};
     uint32_t clientRefreshRateHz_ = 90;
     protocol::ClientFoveationPreset clientFoveationPreset_ =
         protocol::ClientFoveationPreset::Off;
@@ -343,6 +349,10 @@ private:
     protocol::StreamConfigUpdate completedStreamConfigUpdate_;
     bool hasCompletedStreamConfigUpdate_ = false;
     bool completedStreamConfigAccepted_ = false;
+    bool completedStreamConfigDecoderKept_ = false;
+    protocol::StreamConfigUpdate frameDeferredStreamConfig_ = {};
+    std::chrono::steady_clock::time_point frameDeferredStreamConfigSince_ = {};
+    bool hasFrameDeferredStreamConfig_ = false;
     std::thread streamConfigWorkerThread_;
     std::atomic<bool> streamConfigWorkerRunning_{false};
     std::atomic<uint32_t> streamConfigWorkerSequence_{0};

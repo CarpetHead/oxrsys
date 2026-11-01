@@ -184,6 +184,7 @@ add_executable(oxrsys_runtime_tests
     tests/TestPacingThreadPolicy.cpp
     tests/TestPacketPacer.cpp
     tests/TestStreamingReconfigure.cpp
+    tests/TestEncodeBudget.cpp
     tests/TestSnapshotLeasePool.cpp
     tests/TestSwapchainCreateValidation.cpp
     tests/TestVideoCodecSelection.cpp

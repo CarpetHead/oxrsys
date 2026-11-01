@@ -766,6 +766,7 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
 
     frameSource.alphaBlend = oxrsys::runtime::IsAlphaFrameForStreaming(
         frameEndInfo->environmentBlendMode, sourceAlphaProjectionLayer);
+    frameSource.environmentAlphaBlend = environmentAlphaBlend;
 
     if (!environmentAlphaBlend && sourceAlphaProjectionLayer)
     {
@@ -907,6 +908,10 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
         imageSource.sourceY = static_cast<uint32_t>(view.subImage.imageRect.offset.y);
         imageSource.sourceWidth = static_cast<uint32_t>(view.subImage.imageRect.extent.width);
         imageSource.sourceHeight = static_cast<uint32_t>(view.subImage.imageRect.extent.height);
+        imageSource.fov[0] = view.fov.angleLeft;
+        imageSource.fov[1] = view.fov.angleRight;
+        imageSource.fov[2] = view.fov.angleUp;
+        imageSource.fov[3] = view.fov.angleDown;
         if (viewIndex == 0)
         {
             frameSource.left = std::move(imageSource);

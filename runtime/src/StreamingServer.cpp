@@ -116,13 +116,14 @@ oxr::protocol::FoveationPresetParameters FoveationParametersForConfig(const std:
 oxr::protocol::FoveationLayout ConfiguredFoveationLayout(uint32_t targetEyeWidth,
                                                          uint32_t targetEyeHeight,
                                                          oxr::protocol::FoveationPreset preset,
-                                                         const std::string& configPreset)
+                                                         const std::string& configPreset,
+                                                         uint32_t foveationLevel)
 {
     return oxr::protocol::CalculateFoveationLayout(
         targetEyeWidth, targetEyeHeight, preset,
         preset == oxr::protocol::FoveationPreset::Off
             ? oxr::protocol::ParametersForPreset(preset)
-            : FoveationParametersForConfig(configPreset));
+            : oxr::protocol::StrongerFoveationParameters(FoveationParametersForConfig(configPreset), foveationLevel));
 }
 
 oxr::protocol::ClientFoveationPreset ParseClientFoveationPreset(const std::string& value)
@@ -221,6 +222,7 @@ struct StreamLayout
 StreamLayout BuildStreamLayout(uint32_t renderWidth,
                                uint32_t renderHeight,
                                float requestedScale,
+                               uint32_t foveationLevel,
                                const ConfigValues& config,
                                const GraphicsContext& graphicsContext)
 {
@@ -251,7 +253,8 @@ StreamLayout BuildStreamLayout(uint32_t renderWidth,
             layout.foveatedTargetEyeWidth,
             layout.foveatedTargetEyeHeight,
             layout.foveationPreset,
-            config.foveatedEncodingPreset);
+            config.foveatedEncodingPreset,
+            foveationLevel);
         if (unscaledFoveationTarget &&
             oxr::protocol::IsFoveatedEncodingLayoutUsable(
                 layout.foveationLayout, renderWidth, renderHeight))
@@ -621,7 +624,7 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
     wifiEnabled_ = config.streamingTransport != "usb_adb";
     usbAdbEnabled_ = config.streamingTransport != "wifi";
     StreamLayout streamLayout = BuildStreamLayout(
-        renderWidth, renderHeight, config.resolutionScale, config, graphicsContext_);
+        renderWidth, renderHeight, config.resolutionScale, 0, config, graphicsContext_);
     {
         std::lock_guard<std::mutex> layoutLock(streamLayoutMutex_);
         streamLayout_.activeResolutionScale = streamLayout.resolutionScale;
@@ -632,11 +635,13 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
         streamLayout_.foveatedTargetEyeWidth = streamLayout.foveatedTargetEyeWidth;
         streamLayout_.foveatedTargetEyeHeight = streamLayout.foveatedTargetEyeHeight;
         streamLayout_.foveatedEncodingActive = streamLayout.foveatedEncodingActive;
+        streamLayout_.foveationLevel = 0;
         streamLayout_.streamConfigSequence = 0;
     }
     clientFoveatedEncodingActive_.store(false);
     tenBitEncodingActive_.store(false);
     packedAlphaActive_.store(false);
+    dynamicPackedAlpha_.store(false);
     clientSupportsFoveatedEncoding_.store(false);
     clientSupportsStreamReconfigure_.store(false);
     clientSupportsMixedRealityPassthrough_.store(false);
@@ -942,11 +947,13 @@ oxr::protocol::ServerAnnounce StreamingServer::BuildServerAnnounce(
         ConfiguredFoveationLayout(layoutState.foveatedTargetEyeWidth,
                                                 layoutState.foveatedTargetEyeHeight,
                                                 foveationPreset,
-                                                config.foveatedEncodingPreset);
+                                                config.foveatedEncodingPreset,
+                                                layoutState.foveationLevel);
 
     if (layoutState.foveatedEncodingActive)
     {
         announce.serverFeatures |= oxr::protocol::SERVER_FEATURE_FOVEATED_ENCODING;
+        announce.serverFeatures |= oxr::protocol::SERVER_FEATURE_FOVEATION_EYE_CENTER;
     }
     oxr::protocol::ClientFoveationPreset clientFoveationPreset =
         ParseClientFoveationPreset(config.clientFoveationPreset);
@@ -1391,6 +1398,10 @@ void StreamingServer::EncodeThread()
         double queueWaitMs = (double)(SteadyClockNowNs() - frame.timestampNs) / 1.0e6;
         telemetry->queueWaitMs.Add(queueWaitMs);
 
+        // Engines such as Unity mark every projection layer source-alpha, so only the environment blend
+        // mode says the app is showing passthrough.
+        MaybeTogglePackedAlpha(frame.environmentAlphaBlend);
+        MaybeAdjustFoveationForEncodeTime();
         uint32_t currentRefreshHz = std::max(targetRefreshRateHz_.load(), 1u);
         const ConfigValues config = Config::Get().GetValues();
         uint32_t keyframeFrames = std::max(config.keyframeIntervalSec * currentRefreshHz, 1u);
@@ -1427,7 +1438,8 @@ void StreamingServer::EncodeThread()
         encodedFrame->frameIndex = frame.frameIndex;
         encodedFrame->timestampNs = frame.timestampNs;
         encodedFrame->codec = activeVideoCodec_.load();
-        encodedFrame->alphaBlend = frame.alphaBlend;
+        // With dynamic alpha rows, a frame is shown over passthrough only while the app alpha-blends.
+        encodedFrame->alphaBlend = dynamicPackedAlpha_.load() ? frame.environmentAlphaBlend : frame.alphaBlend;
         encodedFrame->packedAlpha = encoder->UsesPackedAlpha();
         encodedFrame->hasPose = frame.hasPose;
         if (frame.hasPose)
@@ -1517,6 +1529,11 @@ void StreamingServer::EncodeThread()
                     MetricSummary gpuSummary = telemetry->gpuCopyMs.Consume();
                     MetricSummary submitSummary = telemetry->encodeSubmitMs.Consume();
                     MetricSummary callbackSummary = telemetry->callbackLatencyMs.Consume();
+                    if (encoder->UsesLowLatencyRateControl() && callbackSummary.average > 0.0)
+                    {
+                        server->encodeTimeAverageMs_.store(callbackSummary.average);
+                        server->encodeTimeWindow_.fetch_add(1);
+                    }
                     MetricSummary totalSummary = telemetry->totalPipelineMs.Consume();
 
                     const uint32_t replacedFrames = server->replacedFrameCount_.exchange(0);
@@ -1878,15 +1895,20 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
                     ConfiguredFoveationLayout(layoutState.foveatedTargetEyeWidth,
                                                             layoutState.foveatedTargetEyeHeight,
                                                             foveationPreset,
-                                                            config.foveatedEncodingPreset);
+                                                            config.foveatedEncodingPreset,
+                                                            layoutState.foveationLevel);
                 const bool clientSupportsFoveatedEncoding =
                     HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING);
                 clientSupportsFoveatedEncoding_.store(clientSupportsFoveatedEncoding);
+                clientSupportsFoveationEyeCenter_.store(
+                    HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATION_EYE_CENTER));
                 const bool useFoveatedEncoding =
                     layoutState.foveatedEncodingActive && clientSupportsFoveatedEncoding;
                 clientFoveatedEncodingActive_.store(useFoveatedEncoding);
-                encoder_->SetFoveationSettings(BuildEncoderFoveationSettings(
-                    useFoveatedEncoding, layout));
+                VideoEncoder::FoveationSettings foveationSettings =
+                    BuildEncoderFoveationSettings(useFoveatedEncoding, layout);
+                foveationSettings.eyeCentered = clientSupportsFoveationEyeCenter_.load();
+                encoder_->SetFoveationSettings(foveationSettings);
                 if (layoutState.foveatedEncodingActive && !clientSupportsFoveatedEncoding)
                 {
                     spdlog::warn("StreamingServer: client '{}' did not advertise foveated encoding support; sending reduced normal video",
@@ -1900,11 +1922,20 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
                         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_TEN_BIT_ENCODING);
                     tenBitEncodingActive_.store(useTenBit);
                     encoder_->SetTenBitEncoding(useTenBit);
-                    const bool usePackedAlpha = config.passthroughEnabled &&
+                    const bool clientUsesPackedAlpha = config.passthroughEnabled &&
                         config.appAlphaBlendPassthrough &&
                         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_MIXED_REALITY_ALPHA);
+                    // Over a reliable transport the alpha rows are added only while the app alpha-blends.
+                    const bool dynamicPackedAlpha = clientUsesPackedAlpha &&
+                        oxrsys::streaming_reconfigure::AllowsLiveReconfigure(
+                            clientUsesUsbAdb_.load(),
+                            HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_STREAM_RECONFIGURE));
+                    dynamicPackedAlpha_.store(dynamicPackedAlpha);
+                    const bool usePackedAlpha = clientUsesPackedAlpha && !dynamicPackedAlpha;
                     packedAlphaActive_.store(usePackedAlpha);
+                    pendingPackedAlpha_.store(usePackedAlpha);
                     encoder_->SetPackedAlpha(usePackedAlpha);
+                    streamConfigAppliedNs_.store(SteadyClockNowNs());
                     if (encoder_->Initialize(layoutState.encodedWidth, layoutState.encodedHeight, negotiatedRefresh,
                                              bitrateMbps, graphicsContext_, selectedCodec))
                     {
@@ -1935,6 +1966,7 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
                 {
                     tenBitEncodingActive_.store(false);
                     packedAlphaActive_.store(false);
+                    dynamicPackedAlpha_.store(false);
                     spdlog::error("StreamingServer: Failed to initialize VideoEncoder for any compatible WiFi codec");
                     encoder_.reset();
                 }
@@ -2113,15 +2145,20 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
                     ConfiguredFoveationLayout(layoutState.foveatedTargetEyeWidth,
                                                             layoutState.foveatedTargetEyeHeight,
                                                             foveationPreset,
-                                                            config.foveatedEncodingPreset);
+                                                            config.foveatedEncodingPreset,
+                                                            layoutState.foveationLevel);
                 const bool clientSupportsFoveatedEncoding =
                     HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING);
                 clientSupportsFoveatedEncoding_.store(clientSupportsFoveatedEncoding);
+                clientSupportsFoveationEyeCenter_.store(
+                    HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATION_EYE_CENTER));
                 const bool useFoveatedEncoding =
                     layoutState.foveatedEncodingActive && clientSupportsFoveatedEncoding;
                 clientFoveatedEncodingActive_.store(useFoveatedEncoding);
-                encoder_->SetFoveationSettings(BuildEncoderFoveationSettings(
-                    useFoveatedEncoding, layout));
+                VideoEncoder::FoveationSettings foveationSettings =
+                    BuildEncoderFoveationSettings(useFoveatedEncoding, layout);
+                foveationSettings.eyeCentered = clientSupportsFoveationEyeCenter_.load();
+                encoder_->SetFoveationSettings(foveationSettings);
                 if (layoutState.foveatedEncodingActive && !clientSupportsFoveatedEncoding)
                 {
                     spdlog::warn("StreamingServer: USB client '{}' did not advertise foveated encoding support; sending reduced normal video",
@@ -2135,11 +2172,20 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
                         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_TEN_BIT_ENCODING);
                     tenBitEncodingActive_.store(useTenBit);
                     encoder_->SetTenBitEncoding(useTenBit);
-                    const bool usePackedAlpha = config.passthroughEnabled &&
+                    const bool clientUsesPackedAlpha = config.passthroughEnabled &&
                         config.appAlphaBlendPassthrough &&
                         HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_MIXED_REALITY_ALPHA);
+                    // Over a reliable transport the alpha rows are added only while the app alpha-blends.
+                    const bool dynamicPackedAlpha = clientUsesPackedAlpha &&
+                        oxrsys::streaming_reconfigure::AllowsLiveReconfigure(
+                            clientUsesUsbAdb_.load(),
+                            HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_STREAM_RECONFIGURE));
+                    dynamicPackedAlpha_.store(dynamicPackedAlpha);
+                    const bool usePackedAlpha = clientUsesPackedAlpha && !dynamicPackedAlpha;
                     packedAlphaActive_.store(usePackedAlpha);
+                    pendingPackedAlpha_.store(usePackedAlpha);
                     encoder_->SetPackedAlpha(usePackedAlpha);
+                    streamConfigAppliedNs_.store(SteadyClockNowNs());
                     if (encoder_->Initialize(layoutState.encodedWidth, layoutState.encodedHeight, negotiatedRefresh,
                                              bitrateMbps, graphicsContext_, selectedCodec))
                     {
@@ -2170,6 +2216,7 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
                 {
                     tenBitEncodingActive_.store(false);
                     packedAlphaActive_.store(false);
+                    dynamicPackedAlpha_.store(false);
                     spdlog::error("StreamingServer: Failed to initialize VideoEncoder for any compatible USB ADB codec");
                     encoder_.reset();
                 }
@@ -2276,6 +2323,7 @@ void StreamingServer::HandleClientDisconnect()
     clientFoveatedEncodingActive_.store(false);
     tenBitEncodingActive_.store(false);
     packedAlphaActive_.store(false);
+    dynamicPackedAlpha_.store(false);
     clientSupportsFoveatedEncoding_.store(false);
     clientSupportsStreamReconfigure_.store(false);
     clientSupportsMixedRealityPassthrough_.store(false);
@@ -2548,7 +2596,7 @@ void StreamingServer::MaybeRequestStreamReconfigure(float targetResolutionScale)
     }
 
     const StreamLayout layout = BuildStreamLayout(
-        renderWidth_, renderHeight_, clampedScale, config, graphicsContext_);
+        renderWidth_, renderHeight_, clampedScale, currentLayout.foveationLevel, config, graphicsContext_);
     if (layout.encodedWidth == currentLayout.encodedWidth &&
         layout.encodedHeight == currentLayout.encodedHeight)
     {
@@ -2557,6 +2605,106 @@ void StreamingServer::MaybeRequestStreamReconfigure(float targetResolutionScale)
         return;
     }
 
+    SendStreamConfigRequest(layout.resolutionScale, packedAlphaActive_.load(), currentLayout.foveationLevel, nowNs);
+}
+
+void StreamingServer::MaybeTogglePackedAlpha(bool frameAlphaBlend)
+{
+    constexpr uint32_t stableFrames = 10;
+    alphaBlendFrameStreak_ = frameAlphaBlend == lastFrameAlphaBlend_ ? alphaBlendFrameStreak_ + 1 : 0;
+    lastFrameAlphaBlend_ = frameAlphaBlend;
+    if (!dynamicPackedAlpha_.load() || state_.load() != State::Connected ||
+        alphaBlendFrameStreak_ < stableFrames || frameAlphaBlend == packedAlphaActive_.load())
+    {
+        return;
+    }
+
+    const int64_t nowNs = SteadyClockNowNs();
+    TickPendingStreamConfigTimeout(nowNs);
+    if (pendingStreamConfigSequence_.load() != 0)
+    {
+        return;
+    }
+    const StreamLayoutState layout = GetStreamLayoutState();
+    const oxrsys::encode_budget::StreamMode mode =
+        frameAlphaBlend ? oxrsys::encode_budget::StreamMode::PackedAlpha : oxrsys::encode_budget::StreamMode::Color;
+    const uint32_t foveationLevel = encodeBudget_.HasLevel(mode)
+        ? encodeBudget_.Level(mode)
+        : MatchingEncodedPixelsLevel(layout.activeResolutionScale, layout.foveationLevel, frameAlphaBlend);
+    encodeBudget_.SetLevel(mode, foveationLevel);
+    SendStreamConfigRequest(layout.activeResolutionScale, frameAlphaBlend, foveationLevel, nowNs);
+}
+
+uint64_t StreamingServer::EncodedPixels(float resolutionScale, uint32_t foveationLevel, bool packedAlpha) const
+{
+    const StreamLayout layout = BuildStreamLayout(
+        renderWidth_, renderHeight_, resolutionScale, foveationLevel, Config::Get().GetValues(), graphicsContext_);
+    const uint64_t height = layout.encodedHeight +
+        (packedAlpha ? oxr::protocol::PackedAlphaRows(layout.encodedHeight) : 0u);
+    return static_cast<uint64_t>(layout.encodedWidth) * height;
+}
+
+uint32_t StreamingServer::MatchingEncodedPixelsLevel(float resolutionScale, uint32_t foveationLevel, bool packedAlpha) const
+{
+    const uint64_t currentPixels = EncodedPixels(resolutionScale, foveationLevel, !packedAlpha);
+    uint32_t level = foveationLevel;
+    while (level < MaxFoveationLevel && EncodedPixels(resolutionScale, level, packedAlpha) > currentPixels)
+    {
+        ++level;
+    }
+    return level;
+}
+
+void StreamingServer::MaybeAdjustFoveationForEncodeTime()
+{
+    const uint32_t window = encodeTimeWindow_.load();
+    if (window == lastEncodeBudgetWindow_)
+    {
+        return;
+    }
+    lastEncodeBudgetWindow_ = window;
+
+    const StreamLayoutState layout = GetStreamLayoutState();
+    const int64_t nowNs = SteadyClockNowNs();
+    constexpr int64_t settleNs = 5000000000;
+    if (state_.load() != State::Connected || !layout.foveatedEncodingActive ||
+        !oxrsys::streaming_reconfigure::AllowsLiveReconfigure(
+            clientUsesUsbAdb_.load(), clientSupportsStreamReconfigure_.load()) ||
+        nowNs - streamConfigAppliedNs_.load() < settleNs)
+    {
+        return;
+    }
+    TickPendingStreamConfigTimeout(nowNs);
+    if (pendingStreamConfigSequence_.load() != 0)
+    {
+        return;
+    }
+
+    const bool packedAlpha = packedAlphaActive_.load();
+    const oxrsys::encode_budget::StreamMode mode =
+        packedAlpha ? oxrsys::encode_budget::StreamMode::PackedAlpha : oxrsys::encode_budget::StreamMode::Color;
+    if (!encodeBudget_.HasLevel(mode))
+    {
+        encodeBudget_.SetLevel(mode, layout.foveationLevel);
+    }
+    const double averageEncodeMs = encodeTimeAverageMs_.load();
+    const double framePeriodMs = 1000.0 / static_cast<double>(std::max(targetRefreshRateHz_.load(), 1u));
+    const uint32_t foveationLevel = encodeBudget_.Update(mode, averageEncodeMs, framePeriodMs);
+    if (foveationLevel == layout.foveationLevel)
+    {
+        return;
+    }
+    spdlog::info("StreamingServer: encoding took {:.1f} ms of a {:.1f} ms frame; foveation level {} -> {}",
+                 averageEncodeMs, framePeriodMs, layout.foveationLevel, foveationLevel);
+    SendStreamConfigRequest(layout.activeResolutionScale, packedAlpha, foveationLevel, nowNs);
+}
+
+void StreamingServer::SendStreamConfigRequest(float resolutionScale, bool packedAlpha, uint32_t foveationLevel, int64_t nowNs)
+{
+    const ConfigValues config = Config::Get().GetValues();
+    const StreamLayoutState currentLayout = GetStreamLayoutState();
+    const StreamLayout layout = BuildStreamLayout(
+        renderWidth_, renderHeight_, resolutionScale, foveationLevel, config, graphicsContext_);
     oxr::protocol::StreamConfigUpdate update = {};
     update.sequence = currentLayout.streamConfigSequence + 1;
     update.renderWidth = renderWidth_ * 2;
@@ -2588,6 +2736,8 @@ void StreamingServer::MaybeRequestStreamReconfigure(float targetResolutionScale)
         std::lock_guard<std::mutex> lock(streamConfigMutex_);
         pendingStreamConfigUpdate_ = update;
         pendingResolutionScale_.store(layout.resolutionScale);
+        pendingPackedAlpha_.store(packedAlpha);
+        pendingFoveationLevel_.store(foveationLevel);
         pendingStreamConfigSequence_.store(update.sequence);
         streamConfigPending_.Begin(update.sequence, nowNs);
     }
@@ -2601,9 +2751,9 @@ void StreamingServer::MaybeRequestStreamReconfigure(float targetResolutionScale)
         return;
     }
 
-    spdlog::info("StreamingServer: requested stream config update seq={} scale={:.2f} encoded={}x{}",
+    spdlog::info("StreamingServer: requested stream config update seq={} scale={:.2f} encoded={}x{} packedAlpha={} foveationLevel={}",
                  update.sequence, layout.resolutionScale,
-                 update.encodedWidth, update.encodedHeight);
+                 update.encodedWidth, update.encodedHeight, packedAlpha, foveationLevel);
 }
 
 void StreamingServer::ApplyPendingStreamConfigLocked(
@@ -2611,8 +2761,9 @@ void StreamingServer::ApplyPendingStreamConfigLocked(
 {
     const ConfigValues config = Config::Get().GetValues();
     const float targetScale = pendingResolutionScale_.load();
+    const uint32_t foveationLevel = pendingFoveationLevel_.load();
     const StreamLayout layout = BuildStreamLayout(
-        renderWidth_, renderHeight_, targetScale, config, graphicsContext_);
+        renderWidth_, renderHeight_, targetScale, foveationLevel, config, graphicsContext_);
     if (layout.encodedWidth != update.encodedWidth ||
         layout.encodedHeight != update.encodedHeight)
     {
@@ -2629,10 +2780,13 @@ void StreamingServer::ApplyPendingStreamConfigLocked(
     auto newEncoder = std::make_shared<VideoEncoder>();
     const bool useFoveatedEncoding =
         layout.foveatedEncodingActive && clientSupportsFoveatedEncoding_.load();
-    newEncoder->SetFoveationSettings(BuildEncoderFoveationSettings(
-        useFoveatedEncoding, layout.foveationLayout));
+    VideoEncoder::FoveationSettings foveationSettings =
+        BuildEncoderFoveationSettings(useFoveatedEncoding, layout.foveationLayout);
+    foveationSettings.eyeCentered = clientSupportsFoveationEyeCenter_.load();
+    newEncoder->SetFoveationSettings(foveationSettings);
     newEncoder->SetTenBitEncoding(tenBitEncodingActive_.load());
-    newEncoder->SetPackedAlpha(packedAlphaActive_.load());
+    const bool packedAlpha = pendingPackedAlpha_.load();
+    newEncoder->SetPackedAlpha(packedAlpha);
 
     const uint32_t bitrateMbps = currentBitrateMbps_.load();
     const uint32_t refreshHz = std::max(targetRefreshRateHz_.load(), 1u);
@@ -2695,9 +2849,12 @@ void StreamingServer::ApplyPendingStreamConfigLocked(
         streamLayout_.foveatedTargetEyeWidth = layout.foveatedTargetEyeWidth;
         streamLayout_.foveatedTargetEyeHeight = layout.foveatedTargetEyeHeight;
         streamLayout_.foveatedEncodingActive = layout.foveatedEncodingActive;
+        streamLayout_.foveationLevel = foveationLevel;
         streamLayout_.streamConfigSequence = update.sequence;
     }
+    streamConfigAppliedNs_.store(SteadyClockNowNs());
     clientFoveatedEncodingActive_.store(useFoveatedEncoding);
+    packedAlphaActive_.store(packedAlpha);
     {
         std::lock_guard<std::mutex> lock(streamConfigMutex_);
         ResetPendingStreamConfigLocked();
@@ -2840,6 +2997,7 @@ void StreamingServer::SendFrame(FrameSource frameSource,
     frame.frameIndex = frameIndex_++;
     frame.timestampNs = SteadyClockNowNs();
     frame.alphaBlend = frameSource.alphaBlend;
+    frame.environmentAlphaBlend = frameSource.environmentAlphaBlend;
     frame.valid = true;
     pendingFrameDepthMax_.store(std::max(pendingFrameDepthMax_.load(), 1u));
 

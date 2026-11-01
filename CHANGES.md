@@ -11,9 +11,29 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
   action. Before, both calls succeeded without anything reaching the headset.
 - Added packed passthrough alpha. When passthrough and `app_alpha_blend_passthrough` are enabled and the
   Quest/Pico client advertises `CLIENT_CAPABILITY_MIXED_REALITY_ALPHA`, the runtime appends each eye's alpha
-  below the eyes at half the eye height and marks the frames `VIDEO_FLAG_PACKED_ALPHA`. The client reads that
-  alpha instead of keying out near-black pixels, so black content stays opaque and semi-transparent content
-  blends with the passthrough cameras.
+  below the eyes at half the encoded eye's width and height, following foveated encoding, and marks the
+  frames `VIDEO_FLAG_PACKED_ALPHA`; the frame grows by a quarter. The client reads that alpha instead of
+  keying out near-black pixels, so black content stays opaque and semi-transparent content blends with the
+  passthrough cameras. Each alpha pixel is the mean of a 2x2 block of encoded pixels, and the client rebuilds
+  an edge pixel's alpha from its premultiplied colour against the block's mean colour, so coloured edges keep
+  the full resolution. Over a reliable control transport the alpha rows are added through stream
+  reconfiguration only while the app alpha-blends its environment, so VR content keeps the smaller frame.
+- Added encode-time foveation. With low-latency rate control and a reliable control transport, when encoding
+  takes longer than 1.15 frame periods for three seconds the runtime reconfigures the stream one step
+  stronger (a 12% smaller full-resolution centre and edges compressed one step further, about 20% fewer
+  encoded pixels per step, up to four steps), and steps back towards the configured preset after five
+  seconds under 0.75 of a frame period, never to a step that was too slow. Turning on packed alpha starts at
+  the step whose frame, alpha included, is no larger than the colour-only frame. On an M1 Pro at 72 Hz
+  passthrough streams 2304x1120 eyes with alpha in about 12 ms per frame.
+- Added eye-centred foveated encoding: a client advertising `CLIENT_CAPABILITY_FOVEATION_EYE_CENTER` is
+  sent `SERVER_FEATURE_FOVEATION_EYE_CENTER`, and both sides centre each eye's full-resolution region on
+  that eye's forward direction from its fov, so the sharp regions of the two eyes coincide. The runtime
+  also averages each encoded pixel's whole source span (up to six taps per axis) instead of one bilinear
+  sample, which removes aliasing and skipped rows in the compressed bands.
+- Added `render_device = "quest3_native"` (2064x2208 per eye, the Quest 3 panel's recommended resolution)
+  and `streaming.encoder_low_latency` (default `true`) to choose the standard rate control instead.
+- The Quest client renders into a swapchain 1.3 times its recommended size (capped at the runtime maximum)
+  and requests `XR_FB_composition_layer_settings` quality supersampling and sharpening when available.
 - Added `pacing_thread = "realtime"` (`[streaming]`, default `"default"`): the thread that waits in
   `xrWaitFrame` gets a Mach time-constraint policy, so its sleep to each frame deadline wakes on time.
   At default priority that wake lands about 2.7 ms late on average and up to 6 ms (M5, 72 Hz), which
@@ -78,6 +98,10 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
   fall back to the standard rate control when the encoder does not offer it. On an M1 Pro (Apple Silicon)
   at 2272x1264, 72 fps, HEVC, the time from submitting a frame to receiving it encoded fell from about
   32 ms to about 11 ms; the standard rate control held each frame for about two frame periods.
+- The Quest client keeps its decoder across stream reconfigurations that fit the size it was created for
+  (adaptive playback sized for the connect-time frame plus alpha rows) and applies the new layout with the
+  first frame of the new size, so turning passthrough on or off or changing foveation no longer shows the
+  shell between frames. It detects packed alpha from each decoded frame's height instead of the packet flag.
 - The in-process VideoToolbox session now requires the hardware encoder when VideoToolbox reports
   one for the negotiated codec, retrying without the requirement only if that create fails, and the
   runtime log states whether the session it got is hardware or software.

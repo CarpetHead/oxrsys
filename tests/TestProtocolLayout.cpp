@@ -5,7 +5,9 @@
 #include <Foveation.h>
 #include <Protocol.h>
 
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 using namespace oxr::protocol;
 
@@ -178,12 +180,43 @@ TEST_CASE("Packed alpha rows recover the eye height from the encoded height", "[
 {
     STATIC_REQUIRE(VIDEO_FLAG_ALPHA_BLEND == 0x40);
     STATIC_REQUIRE(VIDEO_FLAG_PACKED_ALPHA == 0x80);
-    CHECK(PackedAlphaRows(1264) == 632);
-    CHECK(PackedAlphaRows(1680) == 840);
-    CHECK(PackedAlphaRows(63) == 32);
+    CHECK(PackedAlphaRows(1264) == 316);
+    CHECK(PackedAlphaRows(1680) == 420);
+    CHECK(PackedAlphaRows(63) == 16);
     for (uint32_t eyeHeight = 1; eyeHeight <= 4096; ++eyeHeight)
     {
         INFO("eye height " << eyeHeight);
         CHECK(PackedAlphaEyeHeight(eyeHeight + PackedAlphaRows(eyeHeight)) == eyeHeight);
+    }
+}
+
+TEST_CASE("Eye centre shift puts the full-resolution region on the eye's forward direction", "[protocol][foveation]")
+{
+    CHECK(EyeCenterShift(1.0f, 1.0f, 0.5f) == 0.0f);
+    // Quest 3 left eye: about 49.8 degrees outwards and 37.9 inwards.
+    const float shift = EyeCenterShift(std::tan(0.869f), std::tan(0.662f), 0.5f);
+    CHECK(shift > 0.35f);
+    CHECK(shift < 0.45f);
+    CHECK(std::fabs(EyeCenterShift(std::tan(0.662f), std::tan(0.869f), 0.5f) + shift) < 1e-5f);
+    CHECK(EyeCenterShift(10.0f, 0.1f, 0.5f) == 1.0f);
+    CHECK(EyeCenterShift(0.0f, 0.0f, 0.5f) == 0.0f);
+    CHECK(EyeCenterShift(1.0f, 2.0f, 1.0f) == 0.0f);
+}
+
+TEST_CASE("Stronger foveation levels encode fewer pixels", "[protocol][foveation]")
+{
+    const FoveationPresetParameters base = MediumPlusParameters();
+    CHECK(StrongerFoveationParameters(base, 0).centerSizeX == base.centerSizeX);
+
+    uint64_t previousPixels = UINT64_MAX;
+    for (uint32_t level = 0; level <= 4; ++level)
+    {
+        INFO("level " << level);
+        const FoveationLayout layout = CalculateFoveationLayout(
+            2064, 2208, FoveationPreset::Medium, StrongerFoveationParameters(base, level));
+        REQUIRE(IsFoveatedEncodingLayoutUsable(layout, 2064, 2208));
+        const uint64_t pixels = static_cast<uint64_t>(layout.optimizedEyeWidth) * layout.optimizedEyeHeight;
+        CHECK(pixels < previousPixels);
+        previousPixels = pixels;
     }
 }

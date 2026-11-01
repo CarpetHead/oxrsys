@@ -8,6 +8,8 @@
 #import "OverlayCompositor.h"
 #import "VideoTextureFormat.h"
 
+#include <Foveation.h>
+
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
@@ -80,6 +82,7 @@ struct MetalFoveationUniforms
     vector_float2 edgeRatio;
     vector_float2 eyeSizeRatio;
     vector_uint2 sourceSrgb;
+    vector_float2 rightCenterShift;
 };
 
 struct MetalAlphaPackUniforms
@@ -89,7 +92,9 @@ struct MetalAlphaPackUniforms
     uint32_t eyeHeight;
     uint32_t alphaRows;
     uint32_t stereo;
-    uint32_t padding[3];
+    uint32_t padding;
+    float sourceUvScale[2];
+    float rightSourceUvOffset[2];
 };
 
 struct MetalVideoCopyUniforms
@@ -152,9 +157,9 @@ struct AlphaPackUniforms
     uint eyeHeight;
     uint alphaRows;
     uint stereo;
-    uint padding0;
-    uint padding1;
-    uint padding2;
+    uint padding;
+    float2 sourceUvScale;
+    float2 rightSourceUvOffset;
 };
 
 kernel void alpha_pack_kernel(texture2d<float, access::sample> leftTexture [[texture(0)]],
@@ -169,10 +174,30 @@ kernel void alpha_pack_kernel(texture2d<float, access::sample> leftTexture [[tex
         return;
     }
 
-    bool rightEye = params.stereo != 0 && gid.x >= params.eyeWidth;
-    uint localX = rightEye ? gid.x - params.eyeWidth : gid.x;
-    float2 uv = (float2(localX, gid.y) + float2(0.5)) / float2(params.eyeWidth, params.alphaRows);
-    float alpha = rightEye ? rightTexture.sample(linearSampler, uv).a : leftTexture.sample(linearSampler, uv).a;
+    uint tileWidth = max(params.eyeWidth / 2, 1u);
+    uint tile = min(gid.x / tileWidth, params.stereo != 0 ? 3u : 1u);
+    bool rightEye = tile >= 2;
+    uint lowerHalf = tile & 1u;
+    float2 alphaSize = float2(tileWidth, params.alphaRows * 2);
+    float2 alphaTexel = float2(gid.x - tile * tileWidth, gid.y + lowerHalf * params.alphaRows);
+    texture2d<float, access::sample> source = rightEye ? rightTexture : leftTexture;
+    float2 sourceTexel = 1.0 / float2(source.get_width(), source.get_height());
+    float2 eyeOrigin = rightEye ? params.rightSourceUvOffset : float2(0.0);
+    float2 eyeMin = eyeOrigin + 0.5 * sourceTexel;
+    float2 eyeMax = eyeOrigin + params.sourceUvScale - 0.5 * sourceTexel;
+    float2 span = 1.0 / alphaSize;
+    // Each bilinear tap averages a 2x2 source block, so taps one source texel pair apart cover the span.
+    int2 taps = clamp(int2(ceil(span * params.sourceUvScale / sourceTexel * 0.5)), int2(1), int2(4));
+    float alpha = 0.0;
+    for (int y = 0; y < taps.y; ++y)
+    {
+        for (int x = 0; x < taps.x; ++x)
+        {
+            float2 eyeUv = (alphaTexel + (float2(x, y) + 0.5) / float2(taps)) * span;
+            alpha += source.sample(linearSampler, clamp(eyeOrigin + eyeUv * params.sourceUvScale, eyeMin, eyeMax)).a;
+        }
+    }
+    alpha /= float(taps.x * taps.y);
     outputTexture.write(float4(alpha, alpha, alpha, 1.0), uint2(gid.x, params.eyeHeight + gid.y));
 }
 )METAL";
@@ -190,6 +215,7 @@ struct FoveationUniforms
     float2 edgeRatio;
     float2 eyeSizeRatio;
     uint2 sourceSrgb;
+    float2 rightCenterShift;
 };
 
 static float3 linear_to_srgb(float3 value)
@@ -244,16 +270,35 @@ kernel void foveation_kernel(texture2d<float, access::sample> leftTexture [[text
     uint eyeWidth = max(outputWidth / 2, 1u);
     bool rightEye = gid.x >= eyeWidth;
     uint localX = rightEye ? gid.x - eyeWidth : gid.x;
-    float2 uv = (float2(localX, gid.y) + float2(0.5)) / float2(eyeWidth, outputHeight);
-    float2 eyeUv = uv / max(params.eyeSizeRatio, float2(0.0001));
-    float2 compressedUv;
-    compressedUv.x = compress_axis(eyeUv.x, params.centerSize.x, params.centerShift.x, params.edgeRatio.x);
-    compressedUv.y = compress_axis(eyeUv.y, params.centerSize.y, params.centerShift.y, params.edgeRatio.y);
-    compressedUv = clamp(compressedUv, float2(0.0), float2(1.0));
+    float2 shift = rightEye ? params.rightCenterShift : params.centerShift;
+    float2 outputTexel = 1.0 / float2(eyeWidth, outputHeight);
+    float2 eyeScale = 1.0 / max(params.eyeSizeRatio, float2(0.0001));
+    float2 uv = (float2(localX, gid.y) + float2(0.5)) * outputTexel;
 
-    float4 color = rightEye
-        ? rightTexture.sample(linearSampler, compressedUv)
-        : leftTexture.sample(linearSampler, compressedUv);
+    // The source span this output pixel covers. In compressed bands it spans several source pixels,
+    // which are averaged instead of keeping one bilinear sample.
+    float2 lo = (uv - 0.5 * outputTexel) * eyeScale;
+    float2 hi = (uv + 0.5 * outputTexel) * eyeScale;
+    float2 sourceLo = float2(compress_axis(lo.x, params.centerSize.x, shift.x, params.edgeRatio.x),
+                             compress_axis(lo.y, params.centerSize.y, shift.y, params.edgeRatio.y));
+    float2 sourceHi = float2(compress_axis(hi.x, params.centerSize.x, shift.x, params.edgeRatio.x),
+                             compress_axis(hi.y, params.centerSize.y, shift.y, params.edgeRatio.y));
+    float2 sourceSize = rightEye ? float2(rightTexture.get_width(), rightTexture.get_height())
+                                 : float2(leftTexture.get_width(), leftTexture.get_height());
+    int2 taps = clamp(int2(ceil(abs(sourceHi - sourceLo) * sourceSize)), int2(1), int2(6));
+
+    float4 color = float4(0.0);
+    for (int ty = 0; ty < taps.y; ++ty)
+    {
+        for (int tx = 0; tx < taps.x; ++tx)
+        {
+            float2 sourceUv = clamp(mix(sourceLo, sourceHi, (float2(tx, ty) + 0.5) / float2(taps)),
+                                    float2(0.0), float2(1.0));
+            color += rightEye ? rightTexture.sample(linearSampler, sourceUv)
+                              : leftTexture.sample(linearSampler, sourceUv);
+        }
+    }
+    color /= float(taps.x * taps.y);
     if (params.sourceSrgb[rightEye ? 1 : 0] != 0)
     {
         color.rgb = linear_to_srgb(color.rgb);
@@ -1060,8 +1105,12 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
             forceSoftware ? @NO : @YES,
         (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:
             hardwareInProcess ? @YES : @NO,
-        (NSString*)kVTVideoEncoderSpecification_EnableLowLatencyRateControl: @YES,
     }];
+    const bool requestLowLatency = initialConfig.encoderLowLatency;
+    if (requestLowLatency)
+    {
+        encoderSpec[(NSString*)kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = @YES;
+    }
 
     VTCompressionSessionRef compressionSession = nullptr;
     OSStatus status = VTCompressionSessionCreate(
@@ -1075,8 +1124,9 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         CompressionOutputCallback,
         nullptr,
         &compressionSession);
-    const bool lowLatencyRateControl = status == noErr;
-    if (!lowLatencyRateControl)
+    const bool lowLatencyRateControl = status == noErr && requestLowLatency;
+    lowLatencyRateControl_ = lowLatencyRateControl;
+    if (status != noErr && requestLowLatency)
     {
         spdlog::info("VideoEncoder: {} low-latency rate control unavailable ({}); using the standard rate control",
                      VideoCodecName(codec_), status);
@@ -1540,7 +1590,8 @@ void VideoEncoder::OnHelperDied()
     ReclaimHelperFrames("encoder helper died");
 }
 
-bool VideoEncoder::EncodeAlphaPack(void* commandBuffer, void* leftTexture, void* rightTexture, void* outputTexture, bool stereo)
+bool VideoEncoder::EncodeAlphaPack(void* commandBuffer, void* leftTexture, void* rightTexture, void* outputTexture,
+                                   bool stereo, bool eyesSideBySide)
 {
     id<MTLCommandBuffer> cmdBuf = (id<MTLCommandBuffer>)commandBuffer;
     id<MTLTexture> leftTex = (id<MTLTexture>)leftTexture;
@@ -1561,6 +1612,10 @@ bool VideoEncoder::EncodeAlphaPack(void* commandBuffer, void* leftTexture, void*
     uniforms.eyeHeight = height_;
     uniforms.alphaRows = frameHeight_ - height_;
     uniforms.stereo = stereo ? 1u : 0u;
+    uniforms.sourceUvScale[0] = eyesSideBySide ? static_cast<float>(uniforms.eyeWidth) / leftTex.width : 1.0f;
+    uniforms.sourceUvScale[1] = eyesSideBySide ? static_cast<float>(height_) / leftTex.height : 1.0f;
+    uniforms.rightSourceUvOffset[0] = eyesSideBySide ? uniforms.sourceUvScale[0] : 0.0f;
+    uniforms.rightSourceUvOffset[1] = 0.0f;
 
     id<MTLComputeCommandEncoder> computeEncoder = [cmdBuf computeCommandEncoder];
     if (computeEncoder == nil)
@@ -2097,6 +2152,24 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         MetalFoveationUniforms uniforms = {};
         uniforms.centerSize = {foveationSettings_.centerSizeX, foveationSettings_.centerSizeY};
         uniforms.centerShift = {foveationSettings_.centerShiftX, foveationSettings_.centerShiftY};
+        uniforms.rightCenterShift = uniforms.centerShift;
+        if (foveationSettings_.eyeCentered)
+        {
+            const float* leftFov = frameSource.left.fov;
+            const float* rightFov = frameSource.right.fov;
+            float leftX = 0.0f;
+            float leftY = 0.0f;
+            float rightX = 0.0f;
+            float rightY = 0.0f;
+            oxr::protocol::EyeCenterShifts(leftFov[0], leftFov[1], leftFov[2], leftFov[3],
+                                           foveationSettings_.centerSizeX, foveationSettings_.centerSizeY,
+                                           leftX, leftY);
+            oxr::protocol::EyeCenterShifts(rightFov[0], rightFov[1], rightFov[2], rightFov[3],
+                                           foveationSettings_.centerSizeX, foveationSettings_.centerSizeY,
+                                           rightX, rightY);
+            uniforms.centerShift = {leftX, leftY};
+            uniforms.rightCenterShift = {rightX, rightY};
+        }
         uniforms.edgeRatio = {foveationSettings_.edgeRatioX, foveationSettings_.edgeRatioY};
         uniforms.eyeSizeRatio = {foveationSettings_.eyeWidthRatio, foveationSettings_.eyeHeightRatio};
         uniforms.sourceSrgb = {
@@ -2249,7 +2322,14 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         [blit endEncoding];
     }
 
-    if (packedAlpha_ && !EncodeAlphaPack((void*)cmdBuf, (void*)leftTex, (void*)(stereo ? rightTex : leftTex), (void*)dstTexture, stereo))
+    // Foveated eyes carry their alpha in the scratch image, so the alpha rows follow the same foveation.
+    id<MTLTexture> foveatedEyes = useFoveatedEncoding ? (id<MTLTexture>)slot.foveatedScratchTexture : nil;
+    const bool packedAlphaPacked = !packedAlpha_ ||
+        (foveatedEyes != nil
+            ? EncodeAlphaPack((void*)cmdBuf, (void*)foveatedEyes, (void*)foveatedEyes, (void*)dstTexture, stereo, true)
+            : EncodeAlphaPack((void*)cmdBuf, (void*)leftTex, (void*)(stereo ? rightTex : leftTex), (void*)dstTexture,
+                              stereo, false));
+    if (!packedAlphaPacked)
     {
         return dropAcquiredSlot("failed to pack eye alpha");
     }

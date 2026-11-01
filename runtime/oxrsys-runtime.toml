@@ -52,6 +52,12 @@ encoder_preset = "balanced"
 # H.264 and clients without the capability continue to receive 8-bit video.
 encoder_10bit = false
 
+# Low-latency rate control returns each frame about one encode time after submission. When frames
+# queue up behind the encoder in that mode, the runtime steps foveated encoding stronger until they fit
+# the refresh rate. Set false to use the standard rate control, which pipelines frames for higher
+# throughput at about two frames of latency.
+encoder_low_latency = true
+
 # Scheduling of the app thread that waits in xrWaitFrame. "default" leaves it alone; "realtime"
 # gives it a Mach time-constraint policy, so its sleep to each frame deadline wakes on time instead
 # of up to several ms late, and the frame cadence holds steady. The thread's previous policy comes back

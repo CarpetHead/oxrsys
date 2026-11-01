@@ -17,6 +17,7 @@ struct StreamingFrame
     int64_t timestampNs = 0;
     bool valid = false;
     bool alphaBlend = false;
+    bool environmentAlphaBlend = false;
 
     float headPosition[3] = {};
     float headOrientation[4] = {0, 0, 0, 1};

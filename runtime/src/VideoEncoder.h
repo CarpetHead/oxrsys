@@ -62,6 +62,8 @@ public:
         float centerShiftY = 0.0f;
         float edgeRatioX = 1.0f;
         float edgeRatioY = 1.0f;
+        // Centre each eye's full-resolution region on its forward direction instead of centerShift.
+        bool eyeCentered = false;
     };
 
     struct BackendCapabilities
@@ -113,7 +115,9 @@ public:
     void SetTenBitEncoding(bool enabled) { tenBit_ = enabled; }
     // Applies before Initialize(): appends oxr::protocol::PackedAlphaRows rows of eye alpha below the eyes.
     void SetPackedAlpha(bool enabled) { packedAlpha_ = enabled; }
+    // Applies before Initialize(): whether to request low-latency rate control (encoder_low_latency also gates it).
     bool UsesPackedAlpha() const { return packedAlpha_; }
+    bool UsesLowLatencyRateControl() const { return lowLatencyRateControl_; }
     // Diagnostics (and tests): pid of the live out-of-process encoder helper
     // frames are currently sent to, or -1 when they are encoded in-process.
     int EncoderHelperPid() const;
@@ -159,7 +163,8 @@ public:
     uint32_t GetInFlightFrameCount() const { return inFlightFrameCount_.load(); }
 
 private:
-    bool EncodeAlphaPack(void* commandBuffer, void* leftTexture, void* rightTexture, void* outputTexture, bool stereo);
+    bool EncodeAlphaPack(void* commandBuffer, void* leftTexture, void* rightTexture, void* outputTexture,
+                         bool stereo, bool eyesSideBySide);
     struct BufferSlot
     {
         void* pixelBuffer = nullptr;      // CVPixelBufferRef
@@ -238,6 +243,7 @@ private:
     FoveationSettings foveationSettings_ = {};
     bool tenBit_ = false;
     bool packedAlpha_ = false;
+    bool lowLatencyRateControl_ = false;
     bool forceSoftwareForTesting_ = false;
     bool inProcessSessionHardware_ = false;
 

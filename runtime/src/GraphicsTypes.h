@@ -99,6 +99,8 @@ struct FrameImageSource
     uint64_t sourceFormat = 0;
     uint32_t imageWidth = 0;
     uint32_t imageHeight = 0;
+    // The submitted view's fov angles in radians: left, right, up, down. All zero when unknown.
+    float fov[4] = {};
 
     void* GetImage() const
     {
@@ -157,6 +159,8 @@ struct FrameSource
     FrameImageSource left = {};
     FrameImageSource right = {};
     bool alphaBlend = false;
+    // The app asked for XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND, not only source-alpha layer flags.
+    bool environmentAlphaBlend = false;
     std::vector<FrameOverlayLayer> overlays = {}; // back to front, all after the projection layer
 
     bool IsStereoValid() const
@@ -169,6 +173,7 @@ struct FrameSource
         left.Reset();
         right.Reset();
         alphaBlend = false;
+        environmentAlphaBlend = false;
         overlays.clear();
     }
 };
