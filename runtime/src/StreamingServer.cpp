@@ -1545,7 +1545,10 @@ void StreamingServer::EncodeThread()
                     MetricSummary gpuSummary = telemetry->gpuCopyMs.Consume();
                     MetricSummary submitSummary = telemetry->encodeSubmitMs.Consume();
                     MetricSummary callbackSummary = telemetry->callbackLatencyMs.Consume();
-                    if (encoder->UsesLowLatencyRateControl() && callbackSummary.average > 0.0)
+                    // A window with under half a second of frames is the connect or a reconfiguration, whose
+                    // first frames set up the encoder, not a measure of what it sustains.
+                    const bool fullWindow = callbackSummary.count * 2 >= server->targetRefreshRateHz_.load();
+                    if (encoder->UsesLowLatencyRateControl() && fullWindow && callbackSummary.average > 0.0)
                     {
                         server->encodeTimeAverageMs_.store(callbackSummary.average);
                         server->encodeTimeWindow_.fetch_add(1);
@@ -1957,7 +1960,6 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
                     packedAlphaActive_.store(usePackedAlpha);
                     pendingPackedAlpha_.store(usePackedAlpha);
                     encoder_->SetPackedAlpha(usePackedAlpha);
-                    streamConfigAppliedNs_.store(SteadyClockNowNs());
                     if (encoder_->Initialize(layoutState.encodedWidth, layoutState.encodedHeight, negotiatedRefresh,
                                              bitrateMbps, graphicsContext_, selectedCodec))
                     {
@@ -1974,6 +1976,7 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
                         encoder_->ForceKeyframe();
                         frameIndex_ = 0;
                         encoderReady = true;
+                        streamConfigAppliedNs_.store(SteadyClockNowNs());
                         const bool usbNetworkClient =
                             oxrsys::streaming_transport::IsUsbNetworkClientAddress(clientIp_);
                         spdlog::info("StreamingServer: Client connected via {}: {} ({}:{}) refresh={}Hz codec={} backend={}",
@@ -2231,7 +2234,6 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
                     packedAlphaActive_.store(usePackedAlpha);
                     pendingPackedAlpha_.store(usePackedAlpha);
                     encoder_->SetPackedAlpha(usePackedAlpha);
-                    streamConfigAppliedNs_.store(SteadyClockNowNs());
                     if (encoder_->Initialize(layoutState.encodedWidth, layoutState.encodedHeight, negotiatedRefresh,
                                              bitrateMbps, graphicsContext_, selectedCodec))
                     {
@@ -2248,6 +2250,7 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
                         encoder_->ForceKeyframe();
                         frameIndex_ = 0;
                         encoderReady = true;
+                        streamConfigAppliedNs_.store(SteadyClockNowNs());
                         spdlog::info("StreamingServer: Client connected via usb_adb: {} refresh={}Hz codec={} backend={}",
                                       clientName, negotiatedRefresh,
                                       VideoCodecName(selectedCodec), backendCapabilities.backendName);
