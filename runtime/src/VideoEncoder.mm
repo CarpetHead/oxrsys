@@ -1132,10 +1132,11 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
                      VideoCodecName(codec_), status);
         [encoderSpec removeObjectForKey:(NSString*)kVTVideoEncoderSpecification_EnableLowLatencyRateControl];
         status = VTCompressionSessionCreate(
-            kCFAllocatorDefault, width, height, VideoToolboxCodecType(codec_),
+            kCFAllocatorDefault, width, frameHeight_, VideoToolboxCodecType(codec_),
             (__bridge CFDictionaryRef)encoderSpec, nullptr, kCFAllocatorDefault,
             CompressionOutputCallback, nullptr, &compressionSession);
     }
+    const bool sessionRequiredHardware = status == noErr && hardwareInProcess;
     if (status != noErr && hardwareInProcess)
     {
         // The query promised a hardware encoder and the create still refused it.
@@ -1261,14 +1262,16 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     // RequireHardware=NO meant a Rosetta host ran the software HEVC encoder with
     // nothing in the log to say so; a line here makes that impossible.
     {
-        bool sessionUsesHardware = false;
+        // A session created with RequireHardware=YES is hardware even when, like the low-latency encoder
+        // VideoToolbox picks (rtvc), it does not answer UsingHardwareAcceleratedVideoEncoder.
+        bool sessionUsesHardware = sessionRequiredHardware;
         CFBooleanRef hardwareRef = nullptr;
         if (VTSessionCopyProperty(compressionSession,
                                   kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
                                   kCFAllocatorDefault, &hardwareRef) == noErr &&
             hardwareRef != nullptr)
         {
-            sessionUsesHardware = CFBooleanGetValue(hardwareRef);
+            sessionUsesHardware = sessionUsesHardware || CFBooleanGetValue(hardwareRef);
             CFRelease(hardwareRef);
         }
         inProcessSessionHardware_ = sessionUsesHardware;
@@ -1292,15 +1295,15 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         }
     }
 
-    // A software session writes full range for a BGRA source (HEVC Main), which
-    // would break the limited-range stream contract exactly when the helper dies
-    // and this session takes over mid-stream. Hand it an explicitly video-range
-    // 4:2:0 conversion of each frame instead; see EncoderSessionColor.h. Set up
-    // now, not on helper death, so the fallback never allocates on the frame path.
-    if (!inProcessSessionHardware_ && !CreateVideoRangeConversion(width, frameHeight_))
+    // A software session (HEVC Main) and the low-latency encoder (rtvc) write full range for a BGRA
+    // source, which would break the limited-range stream contract. Hand them an explicitly video-range
+    // 4:2:0 conversion of each frame instead; see EncoderSessionColor.h. Set up now, not on helper
+    // death, so the fallback never allocates on the frame path.
+    const bool writesFullRangeFromBgra = !inProcessSessionHardware_ || lowLatencyRateControl;
+    if (writesFullRangeFromBgra && !CreateVideoRangeConversion(width, frameHeight_))
     {
-        spdlog::warn("VideoEncoder: could not set up the video-range conversion for the software "
-                     "{} session - its stream may signal full range",
+        spdlog::warn("VideoEncoder: could not set up the video-range conversion for the {} session - "
+                     "its stream may signal full range",
                      VideoCodecName(codec_));
     }
 
@@ -1351,7 +1354,7 @@ bool VideoEncoder::CreateVideoRangeConversion(uint32_t width, uint32_t height)
     }
     videoToolbox_.videoRangeTransfer = transfer;
     videoToolbox_.videoRangePool = pool;
-    spdlog::info("VideoEncoder: software {} session is fed a BT.709 video-range 4:2:0 conversion "
+    spdlog::info("VideoEncoder: {} session is fed a BT.709 video-range 4:2:0 conversion "
                  "of each frame, keeping the stream limited-range",
                  VideoCodecName(codec_));
     return true;
@@ -2511,8 +2514,8 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
                 FinalizeEncodeFrame(context, true);
                 return;
             }
-            // A software session encodes a video-range 4:2:0 copy of the
-            // slot (EncoderSessionColor.h); VideoToolbox retains it for as
+            // A software or low-latency session encodes a video-range 4:2:0
+            // copy of the slot (EncoderSessionColor.h); VideoToolbox retains it for as
             // long as it needs it, so the local reference is dropped below.
             CVPixelBufferRef videoRangeBuffer =
                 (CVPixelBufferRef)this->ConvertToVideoRange(pixelBuffer);

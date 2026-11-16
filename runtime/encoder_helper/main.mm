@@ -97,6 +97,10 @@ struct HelperState
 
     IOSurfaceRef surfaces[kMaxSlots] = {};
     CVPixelBufferRef pixelBuffers[kMaxSlots] = {};
+    // Set while the session uses low-latency rate control, whose encoder (rtvc) writes full range for a
+    // BGRA source: each slot is encoded from a video-range 4:2:0 copy (EncoderSessionColor.h).
+    VTPixelTransferSessionRef videoRangeTransfer = nullptr;
+    CVPixelBufferPoolRef videoRangePool = nullptr;
 
     std::atomic<bool> running{true};
 };
@@ -431,6 +435,62 @@ CFStringRef ProfileLevel(CodecCode codec, ProfileCode profile)
                                           : kVTProfileLevel_HEVC_Main_AutoLevel;
 }
 
+bool CreateVideoRangeConversion()
+{
+    VTPixelTransferSessionRef transfer = oxrsys::encoder_color::CreateVideoRangeTransferSession();
+    if (transfer == nullptr)
+    {
+        return false;
+    }
+    NSDictionary* poolAttributes = @{
+        (NSString*)kCVPixelBufferPoolMinimumBufferCountKey : @(g.slotCount),
+    };
+    NSDictionary* bufferAttributes = @{
+        (NSString*)kCVPixelBufferWidthKey : @(g.width),
+        (NSString*)kCVPixelBufferHeightKey : @(g.height),
+        (NSString*)kCVPixelBufferPixelFormatTypeKey :
+            @(oxrsys::encoder_color::kVideoRangeSourcePixelFormat),
+        (NSString*)kCVPixelBufferIOSurfacePropertiesKey : @{},
+    };
+    CVPixelBufferPoolRef pool = nullptr;
+    if (CVPixelBufferPoolCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttributes,
+                                (__bridge CFDictionaryRef)bufferAttributes, &pool) != kCVReturnSuccess ||
+        pool == nullptr)
+    {
+        VTPixelTransferSessionInvalidate(transfer);
+        CFRelease(transfer);
+        return false;
+    }
+    g.videoRangeTransfer = transfer;
+    g.videoRangePool = pool;
+    LOGI("%s session is fed a BT.709 video-range 4:2:0 conversion of each frame", CodecName(g.codec));
+    return true;
+}
+
+// Returns a retained video-range copy of the slot, or nullptr to encode the slot itself.
+CVPixelBufferRef ConvertToVideoRange(CVPixelBufferRef bgraPixelBuffer)
+{
+    if (g.videoRangeTransfer == nullptr)
+    {
+        return nullptr;
+    }
+    CVPixelBufferRef converted = nullptr;
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g.videoRangePool, &converted) !=
+            kCVReturnSuccess ||
+        converted == nullptr)
+    {
+        return nullptr;
+    }
+    const OSStatus status = VTPixelTransferSessionTransferImage(g.videoRangeTransfer, bgraPixelBuffer, converted);
+    if (status != noErr)
+    {
+        LOGW("video-range conversion failed (%d); encoding the BGRA surface directly", (int)status);
+        CVPixelBufferRelease(converted);
+        return nullptr;
+    }
+    return converted;
+}
+
 InitStatus CreateSession()
 {
     // The same low-latency rate control as the in-process session, with the same fallback.
@@ -445,6 +505,7 @@ InitStatus CreateSession()
                                              CodecType(g.codec),
                                              (__bridge CFDictionaryRef)spec, nullptr,
                                              kCFAllocatorDefault, CompressionCallback, nullptr, &s);
+    const bool lowLatencyRateControl = st == noErr;
     if (st != noErr)
     {
         LOGI("%s low-latency rate control unavailable (%d); using the standard rate control",
@@ -512,20 +573,18 @@ InitStatus CreateSession()
     VTCompressionSessionPrepareToEncodeFrames(s);
     g.session = s;
 
-    // Confirm the hardware encoder was actually selected.
-    bool usingHardware = false;
-    CFBooleanRef hwRef = nullptr;
-    if (VTSessionCopyProperty(s, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
-                              kCFAllocatorDefault, &hwRef) == noErr &&
-        hwRef != nullptr)
+    if (lowLatencyRateControl && !CreateVideoRangeConversion())
     {
-        usingHardware = CFBooleanGetValue(hwRef);
-        CFRelease(hwRef);
+        LOGW("could not set up the video-range conversion for the low-latency %s session - its "
+             "stream may signal full range", CodecName(g.codec));
     }
-    LOGI("VT session created %s/%s %ux%u @%ufps %uMbps hardware=%s", CodecName(g.codec),
+
+    // Both creates above require the hardware encoder, so the session is hardware even when, like the
+    // low-latency encoder VideoToolbox picks (rtvc), it does not answer UsingHardwareAcceleratedVideoEncoder.
+    LOGI("VT session created %s/%s %ux%u @%ufps %uMbps hardware=YES", CodecName(g.codec),
          g.profile == ProfileCode::Main10 ? "Main10" : "Main", g.width, g.height, g.fps,
-         g.bitrateMbps, usingHardware ? "YES" : "NO");
-    return usingHardware ? InitStatus::Ok : InitStatus::HardwareUnavailable;
+         g.bitrateMbps);
+    return InitStatus::Ok;
 }
 
 void HandleEncode(Reader& r)
@@ -558,8 +617,11 @@ void HandleEncode(Reader& r)
     }
 
     CMTime pts = CMTimeMake(ptsNs, 1000000000);
-    OSStatus st = VTCompressionSessionEncodeFrame(g.session, g.pixelBuffers[slot], pts,
-                                                  kCMTimeInvalid, frameProps, ctx, nullptr);
+    CVPixelBufferRef videoRangeBuffer = ConvertToVideoRange(g.pixelBuffers[slot]);
+    OSStatus st = VTCompressionSessionEncodeFrame(
+        g.session, videoRangeBuffer != nullptr ? videoRangeBuffer : g.pixelBuffers[slot], pts,
+        kCMTimeInvalid, frameProps, ctx, nullptr);
+    if (videoRangeBuffer != nullptr) CVPixelBufferRelease(videoRangeBuffer);
     if (frameProps != nullptr) CFRelease(frameProps);
     if (st != noErr)
     {
@@ -706,6 +768,12 @@ int main(int argc, char** argv)
         VTCompressionSessionInvalidate(g.session);
         CFRelease(g.session);
         g.session = nullptr;
+    }
+    if (g.videoRangeTransfer != nullptr)
+    {
+        VTPixelTransferSessionInvalidate(g.videoRangeTransfer);
+        CFRelease(g.videoRangeTransfer);
+        CVPixelBufferPoolRelease(g.videoRangePool);
     }
     for (uint32_t i = 0; i < kMaxSlots; ++i)
     {
