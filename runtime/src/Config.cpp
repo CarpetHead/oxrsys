@@ -274,6 +274,7 @@ void Config::DetectDylibDir()
     logFilePath = stateDir + "/oxrsys-runtime.log";
     questLogFilePath = stateDir + "/oxrsys-headset.log";
     runtimeStatusPath = stateDir + "/runtime_status.json";
+    encoderLimitsPath = stateDir + "/encoder-limits.txt";
 }
 
 // ─── Config file parsing ─────────────────────────────────────────────────────

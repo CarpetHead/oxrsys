@@ -196,6 +196,8 @@ private:
     oxrsys::ClientAdmissionState clientAdmission_;
     void HandleLatencyReport(const oxr::protocol::LatencyReport& report);
     void HandleKeyframeRequest(const oxr::protocol::RequestKeyframe& request);
+    int64_t AppPausedNs(int64_t nowNs) const;
+    void NotifyClientIfAppPaused();
     void HandleStreamConfigAck(const oxr::protocol::StreamConfigAck& ack);
     void HandleNackRequest(const oxr::protocol::NackRequest& request);
     void HandleControlPayload(const uint8_t* data, size_t size);
@@ -206,6 +208,8 @@ private:
     void MaybeAdjustFoveationForEncodeTime();
     uint64_t EncodedPixels(float resolutionScale, uint32_t foveationLevel, bool packedAlpha) const;
     uint32_t MatchingEncodedPixelsLevel(float resolutionScale, uint32_t foveationLevel, bool packedAlpha) const;
+    void UseEncoderLimitsFor(oxr::protocol::VideoCodec codec, bool lowLatencyRateControl);
+    uint32_t SustainableFoveationLevel(float resolutionScale, bool packedAlpha, uint32_t refreshRateHz) const;
     void SendStreamConfigRequest(float resolutionScale, bool packedAlpha, uint32_t foveationLevel, int64_t nowNs);
     void ApplyPendingStreamConfigLocked(const oxr::protocol::StreamConfigUpdate& update);
     void ResetPendingStreamConfigLocked();
@@ -241,6 +245,10 @@ private:
     static constexpr uint32_t MaxFoveationLevel = 4;
     oxrsys::encode_budget::Controller encodeBudget_{MaxFoveationLevel}; // encode thread only
     uint32_t lastEncodeBudgetWindow_ = 0;                                // encode thread only
+    oxrsys::encode_budget::EncoderLimits encoderLimits_;                 // Start and encode thread only
+    std::string encoderLimitsKey_;                                       // Start and encode thread only
+    std::atomic<int64_t> lastAppFrameNs_{0};
+    int64_t lastAppPausedNoticeNs_ = 0;                                  // encode thread only
     std::atomic<double> encodeTimeAverageMs_{0.0};
     std::atomic<uint32_t> encodeTimeWindow_{0};
     std::atomic<int64_t> streamConfigAppliedNs_{0};

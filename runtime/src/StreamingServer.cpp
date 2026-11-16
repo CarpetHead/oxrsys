@@ -624,8 +624,10 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
     wifiEnabled_ = config.streamingTransport != "usb_adb";
     // usb_ncm runs the WiFi UDP path over the USB network link.
     usbAdbEnabled_ = config.streamingTransport != "wifi" && config.streamingTransport != "usb_ncm";
+    UseEncoderLimitsFor(oxr::protocol::VideoCodec::H265, config.encoderLowLatency);
+    const uint32_t foveationLevel = SustainableFoveationLevel(config.resolutionScale, false, refreshRateHz_);
     StreamLayout streamLayout = BuildStreamLayout(
-        renderWidth, renderHeight, config.resolutionScale, 0, config, graphicsContext_);
+        renderWidth, renderHeight, config.resolutionScale, foveationLevel, config, graphicsContext_);
     {
         std::lock_guard<std::mutex> layoutLock(streamLayoutMutex_);
         streamLayout_.activeResolutionScale = streamLayout.resolutionScale;
@@ -639,7 +641,7 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
         streamLayout_.foveation = oxrsys::streaming_foveation::TakeSnapshot(
             streamLayout.foveatedEncodingActive, streamLayout.foveationPreset,
             streamLayout.foveationLayout);
-        streamLayout_.foveationLevel = 0;
+        streamLayout_.foveationLevel = foveationLevel;
         streamLayout_.streamConfigSequence = 0;
     }
     clientFoveatedEncodingActive_.store(false);
@@ -1392,14 +1394,17 @@ void StreamingServer::EncodeThread()
     while (running_.load())
     {
         StreamingFrame frame = {};
-        if (!frameQueue_.WaitPop(running_, frame))
+        const bool popped = frameQueue_.WaitPop(running_, frame, std::chrono::milliseconds(100));
+        if (!popped)
         {
             if (!running_.load())
             {
                 break;
             }
+            NotifyClientIfAppPaused();
             continue;
         }
+        lastAppFrameNs_.store(SteadyClockNowNs());
 
         if (!frame.valid)
         {
@@ -1820,6 +1825,7 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
 
     state_.store(State::Connected);
     lastClientActivityNs_.store(SteadyClockNowNs(), std::memory_order_relaxed);
+    lastAppFrameNs_.store(SteadyClockNowNs());
     lastTrackingCountSeen_.store(
         trackingReceiver_ ? trackingReceiver_->GetPacketCount() : 0, std::memory_order_relaxed);
 
@@ -2095,6 +2101,7 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
 
     state_.store(State::Connected);
     lastClientActivityNs_.store(SteadyClockNowNs(), std::memory_order_relaxed);
+    lastAppFrameNs_.store(SteadyClockNowNs());
     lastTrackingCountSeen_.store(
         trackingReceiver_ ? trackingReceiver_->GetPacketCount() : 0, std::memory_order_relaxed);
 
@@ -2485,8 +2492,44 @@ void StreamingServer::HandleLatencyReport(const oxr::protocol::LatencyReport& re
     }
 }
 
+int64_t StreamingServer::AppPausedNs(int64_t nowNs) const
+{
+    const int64_t lastAppFrameNs = lastAppFrameNs_.load();
+    return lastAppFrameNs > 0 ? nowNs - lastAppFrameNs : 0;
+}
+
+void StreamingServer::NotifyClientIfAppPaused()
+{
+    constexpr int64_t pausedAppNs = 200000000;
+    constexpr int64_t noticeIntervalNs = 250000000;
+    const int64_t nowNs = SteadyClockNowNs();
+    const int64_t pausedNs = AppPausedNs(nowNs);
+    if (state_.load() != State::Connected || pausedNs < pausedAppNs ||
+        nowNs - lastAppPausedNoticeNs_ < noticeIntervalNs)
+    {
+        return;
+    }
+    oxr::protocol::AppPaused notice = {};
+    notice.pausedMs = static_cast<uint32_t>(pausedNs / 1000000);
+    const bool sent = SendControlPayload(&notice, sizeof(notice));
+    if (sent)
+    {
+        lastAppPausedNoticeNs_ = nowNs;
+    }
+}
+
 void StreamingServer::HandleKeyframeRequest(const oxr::protocol::RequestKeyframe& request)
 {
+    // The client sees a stall when the application stops submitting frames, but nothing was lost: the
+    // next frame decodes against the last one, so a keyframe would only cost bitrate when it resumes.
+    constexpr int64_t pausedAppNs = 100000000;
+    const bool stallFromPausedApp = request.reasonFlags == oxr::protocol::KEYFRAME_REASON_DECODE_STALL &&
+        AppPausedNs(SteadyClockNowNs()) >= pausedAppNs;
+    if (stallFromPausedApp)
+    {
+        return;
+    }
+
     requestKeyframeCount_.fetch_add(1);
     requestKeyframeTotalForAbr_.fetch_add(1);
 
@@ -2666,9 +2709,13 @@ void StreamingServer::MaybeTogglePackedAlpha(bool frameAlphaBlend)
     const StreamLayoutState layout = GetStreamLayoutState();
     const oxrsys::encode_budget::StreamMode mode =
         frameAlphaBlend ? oxrsys::encode_budget::StreamMode::PackedAlpha : oxrsys::encode_budget::StreamMode::Color;
-    const uint32_t foveationLevel = encodeBudget_.HasLevel(mode)
+    const uint32_t budgetLevel = encodeBudget_.HasLevel(mode)
         ? encodeBudget_.Level(mode)
         : MatchingEncodedPixelsLevel(layout.activeResolutionScale, layout.foveationLevel, frameAlphaBlend);
+    const uint32_t foveationLevel = std::max(
+        budgetLevel,
+        SustainableFoveationLevel(layout.activeResolutionScale, frameAlphaBlend,
+                                  std::max(targetRefreshRateHz_.load(), 1u)));
     encodeBudget_.SetLevel(mode, foveationLevel);
     SendStreamConfigRequest(layout.activeResolutionScale, frameAlphaBlend, foveationLevel, nowNs);
 }
@@ -2693,6 +2740,35 @@ uint32_t StreamingServer::MatchingEncodedPixelsLevel(float resolutionScale, uint
     return level;
 }
 
+void StreamingServer::UseEncoderLimitsFor(oxr::protocol::VideoCodec codec, bool lowLatencyRateControl)
+{
+    const std::string key = std::string(VideoCodecName(codec)) + (lowLatencyRateControl ? "-low-latency" : "");
+    if (key == encoderLimitsKey_)
+    {
+        return;
+    }
+    encoderLimitsKey_ = key;
+    encoderLimits_ = {};
+    encoderLimits_.Load(Config::Get().encoderLimitsPath, encoderLimitsKey_);
+}
+
+uint32_t StreamingServer::SustainableFoveationLevel(float resolutionScale, bool packedAlpha, uint32_t refreshRateHz) const
+{
+    const bool foveationLevelsDiffer =
+        EncodedPixels(resolutionScale, 0, packedAlpha) != EncodedPixels(resolutionScale, MaxFoveationLevel, packedAlpha);
+    if (!foveationLevelsDiffer)
+    {
+        return 0;
+    }
+    uint32_t level = 0;
+    while (level < MaxFoveationLevel &&
+           !encoderLimits_.Allows(static_cast<double>(EncodedPixels(resolutionScale, level, packedAlpha)) * refreshRateHz))
+    {
+        ++level;
+    }
+    return level;
+}
+
 void StreamingServer::MaybeAdjustFoveationForEncodeTime()
 {
     const uint32_t window = encodeTimeWindow_.load();
@@ -2704,11 +2780,9 @@ void StreamingServer::MaybeAdjustFoveationForEncodeTime()
 
     const StreamLayoutState layout = GetStreamLayoutState();
     const int64_t nowNs = SteadyClockNowNs();
-    constexpr int64_t settleNs = 5000000000;
     if (state_.load() != State::Connected || !layout.foveatedEncodingActive ||
         !oxrsys::streaming_reconfigure::AllowsLiveReconfigure(
-            clientUsesUsbAdb_.load(), clientSupportsStreamReconfigure_.load()) ||
-        nowNs - streamConfigAppliedNs_.load() < settleNs)
+            clientUsesUsbAdb_.load(), clientSupportsStreamReconfigure_.load()))
     {
         return;
     }
@@ -2725,15 +2799,60 @@ void StreamingServer::MaybeAdjustFoveationForEncodeTime()
     {
         encodeBudget_.SetLevel(mode, layout.foveationLevel);
     }
+    const uint32_t refreshRateHz = std::max(targetRefreshRateHz_.load(), 1u);
+    const double framePeriodMs = 1000.0 / static_cast<double>(refreshRateHz);
     const double averageEncodeMs = encodeTimeAverageMs_.load();
-    const double framePeriodMs = 1000.0 / static_cast<double>(std::max(targetRefreshRateHz_.load(), 1u));
-    const uint32_t foveationLevel = encodeBudget_.Update(mode, averageEncodeMs, framePeriodMs);
+    UseEncoderLimitsFor(activeVideoCodec_.load(), Config::Get().GetValues().encoderLowLatency);
+
+    // A level this Mac's encoder already fell behind at (another refresh rate, an earlier session) is
+    // left at once, without waiting for it to fall behind again.
+    const uint32_t sustainableLevel = SustainableFoveationLevel(layout.activeResolutionScale, packedAlpha, refreshRateHz);
+    if (layout.foveationLevel < sustainableLevel)
+    {
+        encodeBudget_.SetLevel(mode, sustainableLevel);
+        spdlog::info("StreamingServer: the encoder fell behind at {:.0f} Mpx/s before; foveation level {} -> {}",
+                     encoderLimits_.OverloadedPixelRate() / 1.0e6, layout.foveationLevel, sustainableLevel);
+        SendStreamConfigRequest(layout.activeResolutionScale, packedAlpha, sustainableLevel, nowNs);
+        return;
+    }
+
+    // Frames encoded right after a reconfiguration include its keyframe; a saturated encoder is clear sooner.
+    const bool saturated = averageEncodeMs > framePeriodMs * oxrsys::encode_budget::Controller::SaturatedFraction;
+    const int64_t settleNs = saturated ? 2000000000 : 5000000000;
+    if (nowNs - streamConfigAppliedNs_.load() < settleNs)
+    {
+        return;
+    }
+
+    const double pixelRate =
+        static_cast<double>(EncodedPixels(layout.activeResolutionScale, layout.foveationLevel, packedAlpha)) * refreshRateHz;
+    const uint32_t budgetLevel = encodeBudget_.Update(mode, averageEncodeMs, framePeriodMs);
+    bool limitsChanged = false;
+    if (budgetLevel > layout.foveationLevel)
+    {
+        limitsChanged = encoderLimits_.RecordOverloaded(pixelRate);
+    }
+    else if (averageEncodeMs < framePeriodMs * oxrsys::encode_budget::Controller::HeadroomFraction)
+    {
+        limitsChanged = encoderLimits_.RecordSustained(pixelRate);
+    }
+    if (limitsChanged)
+    {
+        encoderLimits_.Save(Config::Get().encoderLimitsPath, encoderLimitsKey_);
+    }
+
+    const uint32_t foveationLevel = std::max(
+        budgetLevel, SustainableFoveationLevel(layout.activeResolutionScale, packedAlpha, refreshRateHz));
+    if (foveationLevel != budgetLevel)
+    {
+        encodeBudget_.SetLevel(mode, foveationLevel);
+    }
     if (foveationLevel == layout.foveationLevel)
     {
         return;
     }
-    spdlog::info("StreamingServer: encoding took {:.1f} ms of a {:.1f} ms frame; foveation level {} -> {}",
-                 averageEncodeMs, framePeriodMs, layout.foveationLevel, foveationLevel);
+    spdlog::info("StreamingServer: encoding took {:.1f} ms of a {:.1f} ms frame at {:.0f} Mpx/s; foveation level {} -> {}",
+                 averageEncodeMs, framePeriodMs, pixelRate / 1.0e6, layout.foveationLevel, foveationLevel);
     SendStreamConfigRequest(layout.activeResolutionScale, packedAlpha, foveationLevel, nowNs);
 }
 

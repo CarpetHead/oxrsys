@@ -4,6 +4,10 @@
 
 #include "EncodeBudget.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 using namespace oxrsys::encode_budget;
 
 namespace
@@ -81,4 +85,63 @@ TEST_CASE("Encode budget keeps a level per stream mode", "[streaming][encode_bud
 
     controller.Reset();
     CHECK_FALSE(controller.HasLevel(StreamMode::PackedAlpha));
+}
+
+TEST_CASE("Encode budget steps after one window when the encoder is saturated", "[streaming][encode_budget]")
+{
+    Controller controller(3);
+
+    CHECK(controller.Update(StreamMode::Color, FramePeriodMs * 2.5, FramePeriodMs) == 1);
+    CHECK(controller.Update(StreamMode::Color, FramePeriodMs * 1.5, FramePeriodMs) == 1);
+}
+
+TEST_CASE("Encoder limits allow rates below the lowest overloaded rate", "[streaming][encode_budget]")
+{
+    EncoderLimits limits;
+    CHECK(limits.Allows(300.0e6));
+
+    CHECK(limits.RecordOverloaded(295.0e6));
+    CHECK_FALSE(limits.RecordOverloaded(300.0e6));
+    CHECK(limits.RecordOverloaded(232.0e6));
+    CHECK_FALSE(limits.Allows(232.0e6));
+    CHECK(limits.Allows(186.0e6));
+
+    CHECK(limits.RecordSustained(186.0e6));
+    CHECK_FALSE(limits.RecordSustained(150.0e6));
+    CHECK(limits.SustainedPixelRate() == 186.0e6);
+}
+
+TEST_CASE("Encoder limits forget an overload that a faster rate later sustained", "[streaming][encode_budget]")
+{
+    EncoderLimits limits;
+    limits.RecordOverloaded(200.0e6);
+    limits.RecordSustained(210.0e6);
+
+    CHECK(limits.OverloadedPixelRate() == 0.0);
+    CHECK(limits.Allows(250.0e6));
+}
+
+TEST_CASE("Encoder limits persist per encoder", "[streaming][encode_budget]")
+{
+    const std::string path = std::string(std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR") : "/tmp") +
+                             "/oxrsys-encoder-limits-test.txt";
+    std::remove(path.c_str());
+
+    EncoderLimits hevc;
+    hevc.RecordOverloaded(232.0e6);
+    hevc.RecordSustained(186.0e6);
+    hevc.Save(path, "h265-low-latency");
+    EncoderLimits avc;
+    avc.RecordOverloaded(400.0e6);
+    avc.Save(path, "h264-low-latency");
+
+    EncoderLimits loaded;
+    loaded.Load(path, "h265-low-latency");
+    CHECK(loaded.OverloadedPixelRate() == 232.0e6);
+    CHECK(loaded.SustainedPixelRate() == 186.0e6);
+
+    EncoderLimits unknown;
+    unknown.Load(path, "h265");
+    CHECK(unknown.Allows(1.0e9));
+    std::remove(path.c_str());
 }

@@ -439,6 +439,7 @@ enum class ControlType : uint8_t
     NackRequest = 0x85,        // Client → Server: retransmit specific packets
     StreamConfigUpdate = 0x86, // Server → Client: live encoded stream dimensions changed
     StreamConfigAck = 0x87,    // Client → Server: decoder accepted/rejected the update
+    AppPaused = 0x88,          // Server → Client: the application has submitted no frame for pausedMs
 };
 
 enum StreamConfigUpdateFlags : uint32_t
@@ -528,6 +529,15 @@ struct StreamConfigUpdate
     float foveationCenterShiftY = 0.0f;
     float foveationEdgeRatioX = 1.0f;
     float foveationEdgeRatioY = 1.0f;
+};
+
+// Sent every 250 ms while the application submits no frames (a loading pause): the client keeps showing
+// its last frame instead of treating the missing video as a lost stream.
+struct AppPaused
+{
+    ControlType type = ControlType::AppPaused;
+    uint8_t reserved[3] = {};
+    uint32_t pausedMs = 0;
 };
 
 struct StreamConfigAck

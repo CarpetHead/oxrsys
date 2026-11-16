@@ -449,7 +449,16 @@ public:
             const ssize_t received = recv(controlSocket_, buffer.data(), buffer.size(), 0);
             if (tcp_)
             {
+                // Control records sent before the close, such as AppPaused notices, are not the close.
+                if (received > 0)
+                {
+                    continue;
+                }
                 return received == 0;
+            }
+            if (received > 0 && buffer[0] == static_cast<uint8_t>(oxr::protocol::ControlType::AppPaused))
+            {
+                continue;
             }
             return received == static_cast<ssize_t>(buffer.size()) &&
                    buffer[0] == static_cast<uint8_t>(oxr::protocol::MessageType::ServerAnnounce);

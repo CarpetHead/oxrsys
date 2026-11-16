@@ -1570,6 +1570,7 @@ bool XrApp::InitializeDisplayRefreshRate(float preferredRefreshRateHz)
                                         });
     if (!hasPreferredRate)
     {
+        requestedRefreshRateHz_.store(0);
         LOGW("Preferred %.1fHz not advertised by runtime, keeping current refresh rate",
              preferredRefreshRateHz);
         if (xrGetDisplayRefreshRateFB_ != nullptr)
@@ -1581,6 +1582,8 @@ bool XrApp::InitializeDisplayRefreshRate(float preferredRefreshRateHz)
 
     XrResult requestResult =
         xrRequestDisplayRefreshRateFB_(session_, preferredRefreshRateHz);
+    requestedRefreshRateHz_.store(
+        XR_SUCCEEDED(requestResult) ? static_cast<uint32_t>(std::lround(preferredRefreshRateHz)) : 0u);
     if (XR_FAILED(requestResult))
     {
         LOGW("Failed to request %.1fHz display refresh rate: %d",
@@ -2899,7 +2902,8 @@ void XrApp::SendClientConnect(const char* serverIp)
     connect.maxBitrateMbps = usbAdb || transportMode_ == TransportMode::UsbNetworkUdp
         ? protocol::CLIENT_MAX_BITRATE_USE_SERVER_CONFIG
         : 100;
-    connect.refreshRateHz = clientRefreshRateHz_;
+    const uint32_t requestedRefreshRateHz = requestedRefreshRateHz_.load();
+    connect.refreshRateHz = requestedRefreshRateHz != 0 ? requestedRefreshRateHz : clientRefreshRateHz_;
     connect.clientCapabilities =
         protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING |
         protocol::CLIENT_CAPABILITY_FOVEATION_EYE_CENTER |
@@ -3048,6 +3052,10 @@ void XrApp::HandleControlPayload(const uint8_t* data, size_t size)
         protocol::StreamConfigUpdate update = {};
         memcpy(&update, data, sizeof(update));
         HandleStreamConfigUpdate(update);
+    }
+    else if (type == protocol::ControlType::AppPaused && size >= sizeof(protocol::AppPaused))
+    {
+        lastAppPausedNoticeNs_.store(std::chrono::steady_clock::now().time_since_epoch().count());
     }
     else if (type == protocol::ControlType::Haptics && size >= sizeof(protocol::HapticsCommand))
     {
@@ -3316,6 +3324,13 @@ void XrApp::ApplyCompletedStreamConfigUpdate()
          update.encodedWidth,
          update.encodedHeight,
          decoderKept ? 1 : 0);
+}
+
+bool XrApp::AppPausedRecently(std::chrono::steady_clock::time_point now) const
+{
+    const std::chrono::steady_clock::time_point notice{
+        std::chrono::steady_clock::duration(lastAppPausedNoticeNs_.load())};
+    return now - notice < std::chrono::seconds(1);
 }
 
 bool XrApp::FrameMatchesStreamConfig(const protocol::StreamConfigUpdate& update) const
@@ -3790,8 +3805,10 @@ void XrApp::RunFrame()
         !hasVideoTexture_ &&
         connectionTime_ != std::chrono::steady_clock::time_point{})
     {
-        auto noInitialVideoFor = std::chrono::steady_clock::now() - connectionTime_;
-        if (std::chrono::duration_cast<std::chrono::seconds>(noInitialVideoFor).count() >= 5)
+        const auto now = std::chrono::steady_clock::now();
+        auto noInitialVideoFor = now - connectionTime_;
+        if (std::chrono::duration_cast<std::chrono::seconds>(noInitialVideoFor).count() >= 5 &&
+            !AppPausedRecently(now))
         {
             OnConnectionLost("no initial video frames for 5 seconds");
         }
@@ -4267,9 +4284,12 @@ bool XrApp::RenderFrame(XrTime predictedDisplayTime)
         }
         else if (hasVideoTexture_)
         {
-            // Check if the stream has been lost (no new frames for 2 seconds)
-            auto elapsed = std::chrono::steady_clock::now() - lastVideoFrameTime_;
-            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= 2)
+            // The stream is lost after 2 seconds without frames, unless the server says the application
+            // paused (a loading screen): then the last frame stays up, reprojected, as a compositor would.
+            const auto now = std::chrono::steady_clock::now();
+            auto elapsed = now - lastVideoFrameTime_;
+            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= 2 &&
+                !AppPausedRecently(now))
             {
                 // Stream lost (Godot closed, Mac disconnected, etc.)
                 hasVideoTexture_ = false;
