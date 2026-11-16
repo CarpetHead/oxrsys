@@ -6,6 +6,20 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Added
 
+- Added `OXRSYS_CONFIG_FILE`: when set, the runtime reads that configuration file instead of
+  `~/Library/Application Support/OXRSys/oxrsys-runtime.toml`, for applications that ship their own settings.
+- Added encode-time foveation. With low-latency rate control and a reliable control transport, when encoding
+  takes longer than 1.15 frame periods for three seconds the runtime reconfigures the stream one step
+  stronger (a 12% smaller full-resolution centre and edges compressed one step further, about 20% fewer
+  encoded pixels per step, up to four steps), and steps back towards the configured preset after five
+  seconds under 0.75 of a frame period, never to a step that was too slow.
+- Packed passthrough alpha is half the encoded eye's width and height and follows foveated encoding; the
+  client rebuilds an edge pixel's alpha from its premultiplied colour. Over a reliable control transport the
+  alpha rows are added through stream reconfiguration only while the app alpha-blends its environment, and
+  the Quest client detects packed alpha from each decoded frame's height.
+- Added `streaming.encoder_low_latency` (default `true`) to choose the standard rate control instead.
+- Low-latency sessions (the rtvc encoder) count as hardware when created with RequireHardware, and both
+  encode paths feed them the video-range 4:2:0 conversion, keeping the stream limited-range.
 - Added `render_device = "quest3_native"` (2064x2208 per eye), the Quest 3 panel resolution,
   also selectable in Home.
 - Added the USB network transport (`transport = "usb_ncm"`, USB Net in Home). Home switches the
