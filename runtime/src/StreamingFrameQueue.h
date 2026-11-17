@@ -5,6 +5,7 @@
 #include "GraphicsTypes.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -34,7 +35,8 @@ public:
     void Start();
     void Stop();
     bool PushLatest(StreamingFrame frame);
-    bool WaitPop(const std::atomic<bool>& running, StreamingFrame& outFrame);
+    // Returns false when stopped or when no frame arrived within the timeout.
+    bool WaitPop(const std::atomic<bool>& running, StreamingFrame& outFrame, std::chrono::milliseconds timeout);
     // True when a frame is pending and its snapshots are already done, checked
     // without waiting. A frame the worker waited for is stale when this holds.
     bool HasFinishedPendingFrame() const;

@@ -51,10 +51,11 @@ bool StreamingFrameQueue::PushLatest(StreamingFrame frame)
     return replaced;
 }
 
-bool StreamingFrameQueue::WaitPop(const std::atomic<bool>& running, StreamingFrame& outFrame)
+bool StreamingFrameQueue::WaitPop(const std::atomic<bool>& running, StreamingFrame& outFrame,
+                                  std::chrono::milliseconds timeout)
 {
     std::unique_lock<std::mutex> lock(mutex_);
-    readyCv_.wait(lock, [this, &running] {
+    readyCv_.wait_for(lock, timeout, [this, &running] {
         return !running.load() || stopped_ || pendingFrame_.valid;
     });
 

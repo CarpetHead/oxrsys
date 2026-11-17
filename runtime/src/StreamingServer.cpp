@@ -1387,14 +1387,17 @@ void StreamingServer::EncodeThread()
     while (running_.load())
     {
         StreamingFrame frame = {};
-        if (!frameQueue_.WaitPop(running_, frame))
+        const bool popped = frameQueue_.WaitPop(running_, frame, std::chrono::milliseconds(100));
+        if (!popped)
         {
             if (!running_.load())
             {
                 break;
             }
+            NotifyClientIfAppPaused();
             continue;
         }
+        lastAppFrameNs_.store(SteadyClockNowNs());
 
         if (!frame.valid)
         {
@@ -1805,6 +1808,7 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
 
     state_.store(State::Connected);
     lastClientActivityNs_.store(SteadyClockNowNs(), std::memory_order_relaxed);
+    lastAppFrameNs_.store(SteadyClockNowNs());
     lastTrackingCountSeen_.store(
         trackingReceiver_ ? trackingReceiver_->GetPacketCount() : 0, std::memory_order_relaxed);
 
@@ -2070,6 +2074,7 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
 
     state_.store(State::Connected);
     lastClientActivityNs_.store(SteadyClockNowNs(), std::memory_order_relaxed);
+    lastAppFrameNs_.store(SteadyClockNowNs());
     lastTrackingCountSeen_.store(
         trackingReceiver_ ? trackingReceiver_->GetPacketCount() : 0, std::memory_order_relaxed);
 
@@ -2449,8 +2454,44 @@ void StreamingServer::HandleLatencyReport(const oxr::protocol::LatencyReport& re
     }
 }
 
+int64_t StreamingServer::AppPausedNs(int64_t nowNs) const
+{
+    const int64_t lastAppFrameNs = lastAppFrameNs_.load();
+    return lastAppFrameNs > 0 ? nowNs - lastAppFrameNs : 0;
+}
+
+void StreamingServer::NotifyClientIfAppPaused()
+{
+    constexpr int64_t pausedAppNs = 200000000;
+    constexpr int64_t noticeIntervalNs = 250000000;
+    const int64_t nowNs = SteadyClockNowNs();
+    const int64_t pausedNs = AppPausedNs(nowNs);
+    if (state_.load() != State::Connected || pausedNs < pausedAppNs ||
+        nowNs - lastAppPausedNoticeNs_ < noticeIntervalNs)
+    {
+        return;
+    }
+    oxr::protocol::AppPaused notice = {};
+    notice.pausedMs = static_cast<uint32_t>(pausedNs / 1000000);
+    const bool sent = SendControlPayload(&notice, sizeof(notice));
+    if (sent)
+    {
+        lastAppPausedNoticeNs_ = nowNs;
+    }
+}
+
 void StreamingServer::HandleKeyframeRequest(const oxr::protocol::RequestKeyframe& request)
 {
+    // The client sees a stall when the application stops submitting frames, but nothing was lost: the
+    // next frame decodes against the last one, so a keyframe would only cost bitrate when it resumes.
+    constexpr int64_t pausedAppNs = 100000000;
+    const bool stallFromPausedApp = request.reasonFlags == oxr::protocol::KEYFRAME_REASON_DECODE_STALL &&
+        AppPausedNs(SteadyClockNowNs()) >= pausedAppNs;
+    if (stallFromPausedApp)
+    {
+        return;
+    }
+
     requestKeyframeCount_.fetch_add(1);
     requestKeyframeTotalForAbr_.fetch_add(1);
 

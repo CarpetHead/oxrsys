@@ -119,6 +119,7 @@ private:
     void StreamConfigWorkerMain();
     void ApplyCompletedStreamConfigUpdate();
     void ApplyStreamConfigParameters(const protocol::StreamConfigUpdate& update);
+    bool AppPausedRecently(std::chrono::steady_clock::time_point now) const;
     void SendStreamConfigAck(const protocol::StreamConfigUpdate& update, uint8_t status);
     void SendLatencyReport();
     void RequestKeyframe(uint32_t reasonFlags, uint32_t detail);
@@ -300,6 +301,8 @@ private:
     uint32_t videoHeight_ = 0;
     bool hasVideoTexture_ = false;  // True once we've bound at least one decoded frame
     std::chrono::steady_clock::time_point lastVideoFrameTime_;  // Detect stream loss
+    // steady_clock nanoseconds of the server's last AppPaused notice; written by the control receiver.
+    std::atomic<int64_t> lastAppPausedNoticeNs_{0};
     float videoContentUMin_ = 0.0f;
     float videoContentUMax_ = 1.0f;
     float videoContentVMin_ = 0.0f;

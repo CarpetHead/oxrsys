@@ -3036,6 +3036,10 @@ void XrApp::HandleControlPayload(const uint8_t* data, size_t size)
         memcpy(&update, data, sizeof(update));
         HandleStreamConfigUpdate(update);
     }
+    else if (type == protocol::ControlType::AppPaused && size >= sizeof(protocol::AppPaused))
+    {
+        lastAppPausedNoticeNs_.store(std::chrono::steady_clock::now().time_since_epoch().count());
+    }
     else if (type == protocol::ControlType::Haptics && size >= sizeof(protocol::HapticsCommand))
     {
         protocol::HapticsCommand command = {};
@@ -3303,6 +3307,13 @@ void XrApp::ApplyCompletedStreamConfigUpdate()
          update.encodedWidth,
          update.encodedHeight,
          decoderKept ? 1 : 0);
+}
+
+bool XrApp::AppPausedRecently(std::chrono::steady_clock::time_point now) const
+{
+    const std::chrono::steady_clock::time_point notice{
+        std::chrono::steady_clock::duration(lastAppPausedNoticeNs_.load())};
+    return now - notice < std::chrono::seconds(1);
 }
 
 void XrApp::ApplyStreamConfigParameters(const protocol::StreamConfigUpdate& update)
@@ -3770,8 +3781,10 @@ void XrApp::RunFrame()
         !hasVideoTexture_ &&
         connectionTime_ != std::chrono::steady_clock::time_point{})
     {
-        auto noInitialVideoFor = std::chrono::steady_clock::now() - connectionTime_;
-        if (std::chrono::duration_cast<std::chrono::seconds>(noInitialVideoFor).count() >= 5)
+        const auto now = std::chrono::steady_clock::now();
+        auto noInitialVideoFor = now - connectionTime_;
+        if (std::chrono::duration_cast<std::chrono::seconds>(noInitialVideoFor).count() >= 5 &&
+            !AppPausedRecently(now))
         {
             OnConnectionLost("no initial video frames for 5 seconds");
         }
@@ -4255,9 +4268,12 @@ bool XrApp::RenderFrame(XrTime predictedDisplayTime)
         }
         else if (hasVideoTexture_)
         {
-            // Check if the stream has been lost (no new frames for 2 seconds)
-            auto elapsed = std::chrono::steady_clock::now() - lastVideoFrameTime_;
-            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= 2)
+            // The stream is lost after 2 seconds without frames, unless the server says the application
+            // paused (a loading screen): then the last frame stays up, reprojected, as a compositor would.
+            const auto now = std::chrono::steady_clock::now();
+            auto elapsed = now - lastVideoFrameTime_;
+            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= 2 &&
+                !AppPausedRecently(now))
             {
                 // Stream lost (Godot closed, Mac disconnected, etc.)
                 hasVideoTexture_ = false;

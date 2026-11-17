@@ -19,6 +19,9 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Added controller haptics. `xrApplyHapticFeedback` and `xrStopHapticFeedback` now send `HapticsCommand`
   over the control channel, USB or WiFi, and the Quest/Pico client plays it through its own haptic output
   action. Before, both calls succeeded without anything reaching the headset.
+- Added `AppPaused` (control type `0x88`): while the application submits no frames (a loading pause) the
+  runtime tells the client every 250 ms. The Quest/Pico client keeps showing its last frame instead of
+  reconnecting after 2 seconds, and the runtime ignores decode-stall keyframe requests until frames resume.
 - Added `pacing_thread = "realtime"` (`[streaming]`, default `"default"`): the thread that waits in
   `xrWaitFrame` gets a Mach time-constraint policy, so its sleep to each frame deadline wakes on time.
   At default priority that wake lands about 2.7 ms late on average and up to 6 ms (M5, 72 Hz), which

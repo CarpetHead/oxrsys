@@ -5,6 +5,7 @@
 #include "StreamingFrameQueue.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -81,7 +82,7 @@ TEST_CASE("StreamingFrameQueue replaces the pending frame and releases it", "[st
 
     std::atomic<bool> running{true};
     StreamingFrame popped = {};
-    CHECK(queue.WaitPop(running, popped));
+    CHECK(queue.WaitPop(running, popped, std::chrono::milliseconds(1000)));
     CHECK(popped.frameIndex == 8);
     CHECK(popped.source.left.GetImage() == TestHandle(3));
     CHECK(popped.source.right.GetImage() == TestHandle(4));

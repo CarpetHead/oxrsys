@@ -230,6 +230,13 @@ The control channel currently defines the following payloads over UDP or TCP `Co
 - `NackRequest`
 - `StreamConfigUpdate`
 - `StreamConfigAck`
+- `AppPaused`
+
+`AppPaused` is sent by the runtime every 250 ms while the application has submitted no frame for at least
+200 ms, carrying how long it has been paused. A client that receives one within the last second keeps
+showing its last frame, reprojected, instead of treating the missing video as a lost stream, as a
+compositor keeps an application's last layers up while it loads. The runtime ignores a `RequestKeyframe`
+whose only reason is `KEYFRAME_REASON_DECODE_STALL` while the application is paused: no frame was lost.
 
 `HapticsCommand` carries one hand's vibration from `xrApplyHapticFeedback`: amplitude 0-1, duration in
 milliseconds (0 = the headset's minimum) and frequency in Hz (0 = unspecified). A call sends one command per
