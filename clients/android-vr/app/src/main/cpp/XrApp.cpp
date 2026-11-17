@@ -1558,6 +1558,7 @@ bool XrApp::InitializeDisplayRefreshRate(float preferredRefreshRateHz)
                                         });
     if (!hasPreferredRate)
     {
+        requestedRefreshRateHz_.store(0);
         LOGW("Preferred %.1fHz not advertised by runtime, keeping current refresh rate",
              preferredRefreshRateHz);
         if (xrGetDisplayRefreshRateFB_ != nullptr)
@@ -1569,6 +1570,8 @@ bool XrApp::InitializeDisplayRefreshRate(float preferredRefreshRateHz)
 
     XrResult requestResult =
         xrRequestDisplayRefreshRateFB_(session_, preferredRefreshRateHz);
+    requestedRefreshRateHz_.store(
+        XR_SUCCEEDED(requestResult) ? static_cast<uint32_t>(std::lround(preferredRefreshRateHz)) : 0u);
     if (XR_FAILED(requestResult))
     {
         LOGW("Failed to request %.1fHz display refresh rate: %d",
@@ -2886,7 +2889,8 @@ void XrApp::SendClientConnect(const char* serverIp)
     connect.maxBitrateMbps = usbAdb || transportMode_ == TransportMode::UsbNetworkUdp
         ? protocol::CLIENT_MAX_BITRATE_USE_SERVER_CONFIG
         : 100;
-    connect.refreshRateHz = clientRefreshRateHz_;
+    const uint32_t requestedRefreshRateHz = requestedRefreshRateHz_.load();
+    connect.refreshRateHz = requestedRefreshRateHz != 0 ? requestedRefreshRateHz : clientRefreshRateHz_;
     connect.clientCapabilities =
         protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING |
         protocol::CLIENT_CAPABILITY_FOVEATION_EYE_CENTER |

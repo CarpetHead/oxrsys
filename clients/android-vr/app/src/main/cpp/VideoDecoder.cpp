@@ -2,6 +2,8 @@
 
 #include "VideoDecoder.h"
 
+#include <cstdint>
+
 #include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <android/native_window.h>
@@ -147,6 +149,9 @@ bool VideoDecoder::Initialize(uint32_t width, uint32_t height, uint32_t maxWidth
         AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1);
     }
     AMediaFormat_setInt32(format, "priority", 0); // realtime
+    // Keeps the decoder clocked for the highest rate it can run instead of the stream's frame rate, so each
+    // frame decodes sooner (as ALVR does). Decoders clamp the value to what they support.
+    AMediaFormat_setInt32(format, "operating-rate", INT16_MAX);
 
     // Configure with the AImageReader's surface as output
     media_status_t status = AMediaCodec_configure(

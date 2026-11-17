@@ -94,6 +94,9 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
   runtime maximum, so streams up to the Quest 3 panel resolution are not downscaled into it. It also asks
   the compositor for quality supersampling and sharpening through `XR_FB_composition_layer_settings` when
   the runtime offers the extension.
+- The Quest/Pico client reports the display refresh rate it requested in `ClientConnect` instead of the
+  rate still active while the display switches, so a client built for 72 Hz no longer starts a 90 Hz
+  stream, and it configures its decoder with the highest `operating-rate`.
 - The in-process VideoToolbox session now requires the hardware encoder when VideoToolbox reports
   one for the negotiated codec, retrying without the requirement only if that create fails, and the
   runtime log states whether the session it got is hardware or software.

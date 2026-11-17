@@ -308,6 +308,9 @@ private:
     uint32_t videoContentHeight_ = 0;
     std::atomic<bool> streamHasPackedAlpha_{false};
     uint32_t clientRefreshRateHz_ = 90;
+    // The display refresh rate last requested successfully: the display switches to it a few frames later,
+    // so ClientConnect reports it rather than the rate still active.
+    std::atomic<uint32_t> requestedRefreshRateHz_{0};
     protocol::ClientFoveationPreset clientFoveationPreset_ =
         protocol::ClientFoveationPreset::Off;
     // Foveation preset requested by the server, applied on the render thread in RunFrame().
