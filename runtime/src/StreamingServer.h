@@ -205,7 +205,7 @@ private:
     void TickPendingStreamConfigTimeout(int64_t nowNs);
     void MaybeRequestStreamReconfigure(float targetResolutionScale);
     void MaybeTogglePackedAlpha(bool frameAlphaBlend);
-    void MaybeAdjustFoveationForEncodeTime();
+    void MaybeAdjustFoveationForEncoderBacklog();
     uint64_t EncodedPixels(float resolutionScale, uint32_t foveationLevel, bool packedAlpha) const;
     uint32_t MatchingEncodedPixelsLevel(float resolutionScale, uint32_t foveationLevel, bool packedAlpha) const;
     void UseEncoderLimitsFor(oxr::protocol::VideoCodec codec, bool lowLatencyRateControl);
@@ -249,8 +249,9 @@ private:
     std::string encoderLimitsKey_;                                       // Start and encode thread only
     std::atomic<int64_t> lastAppFrameNs_{0};
     int64_t lastAppPausedNoticeNs_ = 0;                                  // encode thread only
-    std::atomic<double> encodeTimeAverageMs_{0.0};
-    std::atomic<uint32_t> encodeTimeWindow_{0};
+    std::atomic<uint32_t> encodeWindowFrames_{0};
+    std::atomic<uint32_t> encodeWindowBehindFrames_{0};
+    std::atomic<uint32_t> encodeWindow_{0};
     std::atomic<int64_t> streamConfigAppliedNs_{0};
     std::atomic_bool clientSupportsFoveatedEncoding_{false};
     std::atomic_bool clientSupportsFoveationEyeCenter_{false};

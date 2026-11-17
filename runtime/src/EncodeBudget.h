@@ -17,21 +17,31 @@ enum class StreamMode : uint8_t
     PackedAlpha = 1,
 };
 
-// Picks a foveation level per stream mode from the measured encode time: a level whose frames queue up
-// behind the encoder steps to a stronger one and is not tried again, and a level with spare time steps
-// back towards the configured foveation until it reaches one that was too slow. A saturated encoder's
-// average climbs far past the frame period, while a busy app only nudges it over.
+// Picks a foveation level per stream mode from the frames the encoder had to drop because every encode slot
+// still held an earlier frame: a level that keeps dropping frames steps to a stronger one and is not tried
+// again, and a level that drops none steps back towards the configured foveation until it reaches one that
+// dropped frames. How long a frame takes to come back from the encoder does not decide this: low-latency
+// rate control returns frames a whole number of frame periods after submission at any encoded size.
 class Controller
 {
 public:
     static constexpr uint32_t OverloadedWindows = 3;
     static constexpr uint32_t HeadroomWindows = 5;
-    static constexpr double OverloadedFraction = 1.15;
-    static constexpr double HeadroomFraction = 0.75;
-    // Twice the frame period is a saturated encoder, not a busy moment: one window is enough to step.
-    static constexpr double SaturatedFraction = 2.0;
+    static constexpr double OverloadedBehindFraction = 0.05;
+    // A quarter of the frames dropped is a saturated encoder, not a busy moment: one window is enough to step.
+    static constexpr double SaturatedBehindFraction = 0.25;
 
     explicit Controller(uint32_t maxLevel) : maxLevel_(maxLevel) { Reset(); }
+
+    static double BehindFraction(uint32_t behindFrames, uint32_t frames)
+    {
+        return frames > 0 ? static_cast<double>(behindFrames) / static_cast<double>(frames) : 0.0;
+    }
+
+    static bool IsSaturated(uint32_t behindFrames, uint32_t frames)
+    {
+        return BehindFraction(behindFrames, frames) >= SaturatedBehindFraction;
+    }
 
     void Reset()
     {
@@ -52,16 +62,16 @@ public:
         headroomWindows_ = 0;
     }
 
-    // One measurement window of the given mode's current level; returns the level to stream next.
-    uint32_t Update(StreamMode mode, double averageEncodeMs, double framePeriodMs)
+    // One measurement window of the given mode's current level, in which the encoder dropped behindFrames of
+    // the frames it was given; returns the level to stream next.
+    uint32_t Update(StreamMode mode, uint32_t behindFrames, uint32_t frames)
     {
         ModeState& state = modes_[Index(mode)];
         state.hasLevel = true;
-        if (averageEncodeMs > framePeriodMs * OverloadedFraction)
+        if (BehindFraction(behindFrames, frames) >= OverloadedBehindFraction)
         {
             headroomWindows_ = 0;
-            const uint32_t windowsToStep =
-                averageEncodeMs > framePeriodMs * SaturatedFraction ? 1u : OverloadedWindows;
+            const uint32_t windowsToStep = IsSaturated(behindFrames, frames) ? 1u : OverloadedWindows;
             if (++overloadedWindows_ >= windowsToStep && state.level < maxLevel_)
             {
                 state.slowestUsableLevel = std::max(state.slowestUsableLevel, state.level + 1);
@@ -72,7 +82,7 @@ public:
         }
 
         overloadedWindows_ = 0;
-        if (averageEncodeMs < framePeriodMs * HeadroomFraction)
+        if (behindFrames == 0)
         {
             if (++headroomWindows_ >= HeadroomWindows && state.level > state.slowestUsableLevel)
             {
@@ -103,7 +113,7 @@ private:
 };
 
 // The encoded pixel rate (pixels per frame times refresh rate) this Mac's encoder was seen to keep up
-// with and the lowest rate it fell behind at, kept across sessions so a new session or a new refresh rate
+// with and the lowest rate it dropped frames at, kept across sessions so a new session or a new refresh rate
 // starts at a foveation level the encoder can sustain instead of finding it out over several seconds.
 class EncoderLimits
 {

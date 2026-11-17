@@ -1125,7 +1125,6 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         nullptr,
         &compressionSession);
     const bool lowLatencyRateControl = status == noErr && requestLowLatency;
-    lowLatencyRateControl_ = lowLatencyRateControl;
     if (status != noErr && requestLowLatency)
     {
         spdlog::info("VideoEncoder: {} low-latency rate control unavailable ({}); using the standard rate control",
@@ -1986,6 +1985,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         metrics.frameNumber = frameNumberCounter_.fetch_add(1);
         metrics.timestampNs = timestampNs;
         metrics.frameDropped = true;
+        metrics.encoderBehind = true;
         if (frameCallback)
         {
             frameCallback(metrics);

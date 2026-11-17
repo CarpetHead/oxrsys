@@ -9,20 +9,22 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Added `AppPaused` (control type `0x88`): while the application submits no frames (a loading pause) the
   runtime tells the client, which keeps showing its last frame instead of reconnecting after 2 seconds,
   and the runtime ignores the client's decode-stall keyframe requests until frames resume.
-- The runtime remembers the encoded pixel rate the encoder fell behind at and the rate it kept up with, per
-  codec, in `encoder-limits.txt` next to its log, and starts a session, a new refresh rate or packed alpha
-  at a foveation level below that rate. Encode-time foveation steps after one window when encoding takes
-  more than two frame periods.
+- The runtime remembers the encoded pixel rate the encoder dropped frames at and the rate it kept up with, per
+  codec, in `encoder-dropped-frame-limits.txt` next to its log, and starts a session, a new refresh rate or
+  packed alpha at a foveation level below that rate. Adaptive foveation steps after one window when the
+  encoder drops a quarter of its frames.
 - The Quest client reports the refresh rate it requested in `ClientConnect` instead of the rate still active
   while the display switches, so the stream no longer starts at 90 Hz when the runtime asked for 72 Hz, and
   configures its decoder with the highest `operating-rate`.
 - Added `OXRSYS_CONFIG_FILE`: when set, the runtime reads that configuration file instead of
   `~/Library/Application Support/OXRSys/oxrsys-runtime.toml`, for applications that ship their own settings.
-- Added encode-time foveation. With low-latency rate control and a reliable control transport, when encoding
-  takes longer than 1.15 frame periods for three seconds the runtime reconfigures the stream one step
-  stronger (a 12% smaller full-resolution centre and edges compressed one step further, about 20% fewer
-  encoded pixels per step, up to four steps), and steps back towards the configured preset after five
-  seconds under 0.75 of a frame period, never to a step that was too slow.
+- Added adaptive foveation. Over a reliable control transport, when the encoder drops 5% or more of its
+  frames because every encode slot still holds an earlier frame, for three seconds, the runtime reconfigures
+  the stream one step stronger (a 12% smaller full-resolution centre and edges compressed one step further,
+  about 20% fewer encoded pixels per step, up to four steps), and steps back towards the configured preset
+  after five seconds without such drops, never to a step that dropped frames. Encode latency does not decide
+  it: low-latency rate control returns frames one or two frame periods after submission at any encoded size.
+  The per-second encode log reports these drops as `encBehind`.
 - Packed passthrough alpha is half the encoded eye's width and height and follows foveated encoding; the
   client rebuilds an edge pixel's alpha from its premultiplied colour. Over a reliable control transport the
   alpha rows are added through stream reconfiguration only while the app alpha-blends its environment, and

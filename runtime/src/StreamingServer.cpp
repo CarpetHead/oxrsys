@@ -540,6 +540,7 @@ struct EncodeTelemetry
     TelemetryWindow encodeSubmitMs;
     TelemetryWindow callbackLatencyMs;
     TelemetryWindow totalPipelineMs;
+    std::atomic<uint32_t> encoderBehindFrames{0};
     std::mutex logMutex;
     Clock::time_point lastLogTime = Clock::now();
 };
@@ -1417,7 +1418,7 @@ void StreamingServer::EncodeThread()
         // Engines such as Unity mark every projection layer source-alpha, so only the environment blend
         // mode says the app is showing passthrough.
         MaybeTogglePackedAlpha(frame.environmentAlphaBlend);
-        MaybeAdjustFoveationForEncodeTime();
+        MaybeAdjustFoveationForEncoderBacklog();
         uint32_t currentRefreshHz = std::max(targetRefreshRateHz_.load(), 1u);
         const ConfigValues config = Config::Get().GetValues();
         uint32_t keyframeFrames = std::max(config.keyframeIntervalSec * currentRefreshHz, 1u);
@@ -1523,6 +1524,10 @@ void StreamingServer::EncodeThread()
                 {
                     server->encoderDroppedFramesTotalForAbr_.fetch_add(1);
                 }
+                if (metrics.encoderBehind)
+                {
+                    telemetry->encoderBehindFrames.fetch_add(1);
+                }
 
                 telemetry->gpuCopyMs.Add(metrics.gpuCopyMs);
                 telemetry->encodeSubmitMs.Add(metrics.encodeSubmitMs);
@@ -1547,11 +1552,13 @@ void StreamingServer::EncodeThread()
                     MetricSummary callbackSummary = telemetry->callbackLatencyMs.Consume();
                     // A window with under half a second of frames is the connect or a reconfiguration, whose
                     // first frames set up the encoder, not a measure of what it sustains.
+                    const uint32_t encoderBehindFrames = telemetry->encoderBehindFrames.exchange(0);
                     const bool fullWindow = callbackSummary.count * 2 >= server->targetRefreshRateHz_.load();
-                    if (encoder->UsesLowLatencyRateControl() && fullWindow && callbackSummary.average > 0.0)
+                    if (fullWindow)
                     {
-                        server->encodeTimeAverageMs_.store(callbackSummary.average);
-                        server->encodeTimeWindow_.fetch_add(1);
+                        server->encodeWindowFrames_.store(static_cast<uint32_t>(callbackSummary.count));
+                        server->encodeWindowBehindFrames_.store(encoderBehindFrames);
+                        server->encodeWindow_.fetch_add(1);
                     }
                     MetricSummary totalSummary = telemetry->totalPipelineMs.Consume();
 
@@ -1681,7 +1688,7 @@ void StreamingServer::EncodeThread()
                     spdlog::info(
                         "StreamingServer: encode queue(avg/p95={:.2f}/{:.2f}ms) gpu({:.2f}/{:.2f}) "
                         "submit({:.3f}/{:.3f}) callback({:.2f}/{:.2f}) total({:.2f}/{:.2f}) "
-                        "replaced={} encDrops={} keyframeReq={} depthMax={} sendDepth={} sendDrops={} "
+                        "replaced={} encDrops={} encBehind={} keyframeReq={} depthMax={} sendDepth={} sendDrops={} "
                         "tcpFail={} udpRetrans={} abr={}/{} profile={} displayedAge={:.2f}ms reproj={} stale={} poseFallbacks={} "
                         "pacing={:.1f}/{:.1f}ms pacedFlush={} udpSendFail={} pacingLateMax={}us",
                         queueSummary.average, queueSummary.p95,
@@ -1691,6 +1698,7 @@ void StreamingServer::EncodeThread()
                         totalSummary.average, totalSummary.p95,
                         replacedFrames,
                         encoderDrops,
+                        encoderBehindFrames,
                         keyframeRequests,
                         pendingDepthMax,
                         videoSendDepthMax,
@@ -2772,9 +2780,9 @@ uint32_t StreamingServer::SustainableFoveationLevel(float resolutionScale, bool 
     return level;
 }
 
-void StreamingServer::MaybeAdjustFoveationForEncodeTime()
+void StreamingServer::MaybeAdjustFoveationForEncoderBacklog()
 {
-    const uint32_t window = encodeTimeWindow_.load();
+    const uint32_t window = encodeWindow_.load();
     if (window == lastEncodeBudgetWindow_)
     {
         return;
@@ -2803,8 +2811,8 @@ void StreamingServer::MaybeAdjustFoveationForEncodeTime()
         encodeBudget_.SetLevel(mode, layout.foveationLevel);
     }
     const uint32_t refreshRateHz = std::max(targetRefreshRateHz_.load(), 1u);
-    const double framePeriodMs = 1000.0 / static_cast<double>(refreshRateHz);
-    const double averageEncodeMs = encodeTimeAverageMs_.load();
+    const uint32_t frames = encodeWindowFrames_.load();
+    const uint32_t behindFrames = encodeWindowBehindFrames_.load();
     UseEncoderLimitsFor(activeVideoCodec_.load(), Config::Get().GetValues().encoderLowLatency);
 
     // A level this Mac's encoder already fell behind at (another refresh rate, an earlier session) is
@@ -2813,14 +2821,14 @@ void StreamingServer::MaybeAdjustFoveationForEncodeTime()
     if (layout.foveationLevel < sustainableLevel)
     {
         encodeBudget_.SetLevel(mode, sustainableLevel);
-        spdlog::info("StreamingServer: the encoder fell behind at {:.0f} Mpx/s before; foveation level {} -> {}",
+        spdlog::info("StreamingServer: the encoder dropped frames at {:.0f} Mpx/s before; foveation level {} -> {}",
                      encoderLimits_.OverloadedPixelRate() / 1.0e6, layout.foveationLevel, sustainableLevel);
         SendStreamConfigRequest(layout.activeResolutionScale, packedAlpha, sustainableLevel, nowNs);
         return;
     }
 
     // Frames encoded right after a reconfiguration include its keyframe; a saturated encoder is clear sooner.
-    const bool saturated = averageEncodeMs > framePeriodMs * oxrsys::encode_budget::Controller::SaturatedFraction;
+    const bool saturated = oxrsys::encode_budget::Controller::IsSaturated(behindFrames, frames);
     const int64_t settleNs = saturated ? 2000000000 : 5000000000;
     if (nowNs - streamConfigAppliedNs_.load() < settleNs)
     {
@@ -2829,13 +2837,13 @@ void StreamingServer::MaybeAdjustFoveationForEncodeTime()
 
     const double pixelRate =
         static_cast<double>(EncodedPixels(layout.activeResolutionScale, layout.foveationLevel, packedAlpha)) * refreshRateHz;
-    const uint32_t budgetLevel = encodeBudget_.Update(mode, averageEncodeMs, framePeriodMs);
+    const uint32_t budgetLevel = encodeBudget_.Update(mode, behindFrames, frames);
     bool limitsChanged = false;
     if (budgetLevel > layout.foveationLevel)
     {
         limitsChanged = encoderLimits_.RecordOverloaded(pixelRate);
     }
-    else if (averageEncodeMs < framePeriodMs * oxrsys::encode_budget::Controller::HeadroomFraction)
+    else if (behindFrames == 0)
     {
         limitsChanged = encoderLimits_.RecordSustained(pixelRate);
     }
@@ -2854,8 +2862,8 @@ void StreamingServer::MaybeAdjustFoveationForEncodeTime()
     {
         return;
     }
-    spdlog::info("StreamingServer: encoding took {:.1f} ms of a {:.1f} ms frame at {:.0f} Mpx/s; foveation level {} -> {}",
-                 averageEncodeMs, framePeriodMs, pixelRate / 1.0e6, layout.foveationLevel, foveationLevel);
+    spdlog::info("StreamingServer: the encoder dropped {} of {} frames at {:.0f} Mpx/s; foveation level {} -> {}",
+                 behindFrames, frames, pixelRate / 1.0e6, layout.foveationLevel, foveationLevel);
     SendStreamConfigRequest(layout.activeResolutionScale, packedAlpha, foveationLevel, nowNs);
 }
 

@@ -110,7 +110,7 @@ public:
     std::string logFilePath;        // Full path to oxrsys-runtime.log
     std::string questLogFilePath;   // Full path to oxrsys-headset.log
     std::string runtimeStatusPath;  // Full path to runtime_status.json
-    std::string encoderLimitsPath;  // Full path to encoder-limits.txt
+    std::string encoderLimitsPath;  // Full path to encoder-dropped-frame-limits.txt
 
     void Shutdown();
 

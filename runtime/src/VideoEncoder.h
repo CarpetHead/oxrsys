@@ -47,6 +47,8 @@ public:
         double callbackLatencyMs = 0.0;
         double totalLatencyMs = 0.0;
         bool frameDropped = false;
+        // Dropped because every encode slot still held an earlier frame.
+        bool encoderBehind = false;
         bool keyframe = false;
     };
 
@@ -117,7 +119,6 @@ public:
     // Applies before Initialize(): appends oxr::protocol::PackedAlphaRows rows of eye alpha below the eyes.
     void SetPackedAlpha(bool enabled) { packedAlpha_ = enabled; }
     bool UsesPackedAlpha() const { return packedAlpha_; }
-    bool UsesLowLatencyRateControl() const { return lowLatencyRateControl_; }
     // Diagnostics (and tests): pid of the live out-of-process encoder helper
     // frames are currently sent to, or -1 when they are encoded in-process.
     int EncoderHelperPid() const;
@@ -254,7 +255,6 @@ private:
     FoveationSettings foveationSettings_ = {};
     bool tenBit_ = false;
     bool packedAlpha_ = false;
-    bool lowLatencyRateControl_ = false;
     bool forceSoftwareForTesting_ = false;
     bool inProcessSessionHardware_ = false;
 
